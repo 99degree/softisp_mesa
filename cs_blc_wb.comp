@@ -4,7 +4,7 @@
 layout(local_size_x = 32, local_size_y = 8) in;
 layout(set = 0, binding = 0, std430) readonly buffer IB { uint16_t raw[]; };
 layout(set = 0, binding = 1, std430) buffer OB { float16_t outbuf[]; };
-layout(push_constant) uniform P { int w; int h; int bpat; float _pad; };
+layout(push_constant) uniform P { int w; int h; int bpat; int abits; };
 layout(set = 0, binding = 2, std430) readonly buffer GB { float blc[4]; float wb[4]; };
 int ch(int y, int x) {
     int p = bpat;
@@ -18,8 +18,10 @@ void main() {
     int x = int(gl_GlobalInvocationID.x);
     if (y >= h || x >= w) return;
     int c = ch(y, x);
-    /* Go through float for uint16->float16 conversion (driver workaround) */
-    float f = float(uint(raw[y * w + x])) / 65535.0;
+    uint uval = uint(raw[y * w + x]);
+    uint mask = uint((1 << abits) - 1);
+    float max_val = float(mask);
+    float f = float(uval & mask) / max_val;
     float corrected = (f - blc[c]) * wb[c];
     outbuf[y * w + x] = float16_t(clamp(corrected, 0.0, 1.0));
 }

@@ -449,7 +449,7 @@ static void stage_destroy(VulkanCtx *ctx, ComputeStage *s) {
 /* ------------------------------------------------------------------ */
 
 typedef struct { int w, h; } PC_WH;          /* generic width/height */
-typedef struct { int w, h, bpat; float _pad; } PC_Bayer;
+typedef struct { int w, h, bpat, abits; } PC_Bayer;
 typedef struct { int w, h; float _pad0; float _pad1; } PC_WHPad;
 typedef struct { int w, h; float gamma; float contrast; float brightness; float saturation; } PC_Tone;
 typedef struct { int w, h; float strength; float _pad; } PC_Strength;
@@ -485,7 +485,7 @@ static void build_gamma_lut(float *lut, int n, float gamma) {
 
 static double run_blc_wb(VulkanCtx *ctx, ComputeStage *s,
                           GpuBuf *raw_buf, GpuBuf *out_buf,
-                          int w, int h, int bpat)
+                          int w, int h, int bpat, int abits)
 {
     /* Gains buffer: 4 blc values + 4 wb gains */
     float gains[8] = { 0.01f, 0.01f, 0.01f, 0.02f,  /* BLC: R,Gr,Gb,B */
@@ -498,7 +498,7 @@ static double run_blc_wb(VulkanCtx *ctx, ComputeStage *s,
     GpuBuf bindings[] = { *raw_buf, *out_buf, gb };
     stage_bind(ctx, s, bindings, 3);
 
-    PC_Bayer pc = { w, h, bpat, 0 };
+    PC_Bayer pc = { w, h, bpat, abits };
     double dt = stage_dispatch(ctx, s, (w + 31) / 32, (h + 7) / 8, &pc, sizeof(pc));
 
     gpu_buf_free(ctx, &gb);
@@ -507,11 +507,11 @@ static double run_blc_wb(VulkanCtx *ctx, ComputeStage *s,
 
 static double run_demosaic(VulkanCtx *ctx, ComputeStage *s,
                             GpuBuf *in_buf, GpuBuf *out_buf,
-                            int w, int h, int bpat)
+                            int w, int h, int bpat, int abits)
 {
     GpuBuf bindings[] = { *in_buf, *out_buf };
     stage_bind(ctx, s, bindings, 2);
-    PC_Bayer pc = { w, h, bpat, 0 };
+    PC_Bayer pc = { w, h, bpat, abits };
     return stage_dispatch(ctx, s, (w + 15) / 16, (h + 15) / 16, &pc, sizeof(pc));
 }
 
@@ -603,8 +603,9 @@ static double run_ee(VulkanCtx *ctx, ComputeStage *s,
 /*  Generate synthetic Bayer pattern (BGGR)                            */
 /* ------------------------------------------------------------------ */
 
-/* Generate Bayer pattern as uint16 (0-65535 range, normalized to [0,1] in shader) */
-static uint16_t *generate_bayer(int w, int h, int pattern) {
+/* Generate Bayer pattern as uint16 (0-(2^abits-1) range, normalized in shader) */
+static uint16_t *generate_bayer(int w, int h, int pattern, int abits) {
+    uint16_t max_val = (uint16_t)((1 << abits) - 1);
     uint16_t *b = malloc(w * h * sizeof(uint16_t));
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
@@ -620,7 +621,7 @@ static uint16_t *generate_bayer(int w, int h, int pattern) {
                 else            val = (x % 2 == 0) ? g : bl;
             }
             if (val < 0) val = 0; if (val > 1) val = 1;
-            b[y * w + x] = (uint16_t)(val * 65535.0f + 0.5f);
+            b[y * w + x] = (uint16_t)(val * (float)max_val + 0.5f);
         }
     }
     return b;
@@ -827,7 +828,7 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     FastStage f_ee = {st_ee.ds, st_ee.pl, st_ee.pipeline, sizeof(PC_Strength)};
     FastStage f_argb = {st_argb.ds, st_argb.pl, st_argb.pipeline, sizeof(PC_WHPad)};
 
-    PC_Bayer pc_bayer = {width, height, bpat, 0};
+    PC_Bayer pc_bayer = {width, height, bpat, abits};
     PC_WHPad pc_wh = {width, height, 0, 0};
     PC_Tone pc_tone = {width, height, 1.0f/2.2f, 1.2f, 0.05f, 1.3f};
     PC_Strength pc_strength = {width, height, 0.3f, 0};
@@ -1056,8 +1057,8 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     gpu_buf_upload(ctx, &buf_bayer, bayer);
 
     /* Run full pipeline on flat gray */
-    run_blc_wb(ctx, &st_blc_wb, &buf_bayer, &buf_rgb1, width, height, bpat);
-    run_demosaic(ctx, &st_demo, &buf_rgb1, &buf_rgb2, width, height, bpat);
+    run_blc_wb(ctx, &st_blc_wb, &buf_bayer, &buf_rgb1, width, height, bpat, abits);
+    run_demosaic(ctx, &st_demo, &buf_rgb1, &buf_rgb2, width, height, bpat, abits);
     run_ccm(ctx, &st_ccm, &buf_rgb2, &buf_rgb1, width, height);
     run_tone(ctx, &st_tone, &buf_rgb1, &buf_rgb2, width, height);
     run_fcs(ctx, &st_fcs, &buf_rgb2, &buf_rgb1, width, height);
@@ -1128,11 +1129,13 @@ int main(void) {
     int ret = 0;
 
     /* Test at 540p (stats resolution) */
-    ret += test_heavy_pipeline(&ctx, 960, 540, "540p (stats)", 1);
+    int abits = 12;  /* active bits of uint16 Bayer input, e.g. 10, 12, 14, 16 */
+    printf("  uint16 input active bits: %d\n", abits);
+    ret += test_heavy_pipeline(&ctx, 960, 540, "540p (stats)", 1, abits);
     /* Test at 1080p (FHD) */
-    ret += test_heavy_pipeline(&ctx, 1920, 1080, "1080p (FHD)", 1);
+    ret += test_heavy_pipeline(&ctx, 1920, 1080, "1080p (FHD)", 1, abits);
     /* Quick validation at 270p */
-    ret += test_heavy_pipeline(&ctx, 480, 270, "270p (quick)", 0);
+    ret += test_heavy_pipeline(&ctx, 480, 270, "270p (quick)", 0, abits);
 
     vk_destroy(&ctx);
 

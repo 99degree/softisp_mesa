@@ -1,0 +1,31 @@
+#version 460
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, std430) readonly buffer IB { float rgb[]; };
+layout(set = 0, binding = 1, std430) buffer OB { float outbuf[]; };
+layout(push_constant) uniform P { int width; int height; float strength; int radius; };
+void main() {
+    int y = int(gl_GlobalInvocationID.y);
+    int x = int(gl_GlobalInvocationID.x);
+    if (y >= height || x >= width) return;
+    int idx = (y * width + x) * 3;
+    float r = rgb[idx], g = rgb[idx+1], b = rgb[idx+2];
+    float lum = 0.299*r + 0.587*g + 0.114*b;
+    int r2 = radius;
+    int x0 = max(x - r2, 0), x1 = min(x + r2, width - 1);
+    int y0 = max(y - r2, 0), y1 = min(y + r2, height - 1);
+    float sum = 0.0;
+    int cnt = 0;
+    for (int sy = y0; sy <= y1; sy++) {
+        int base = (sy * width + x0) * 3;
+        for (int sx = x0; sx <= x1; sx++) {
+            sum += rgb[base]; base += 3; cnt++;
+        }
+    }
+    float lmean = sum / float(max(cnt, 1));
+    float lc = lum - lmean;
+    float enhanced = lum + lc * strength;
+    float scale = enhanced / max(lum, 0.0001);
+    outbuf[idx]   = clamp(r * scale, 0.0, 1.0);
+    outbuf[idx+1] = clamp(g * scale, 0.0, 1.0);
+    outbuf[idx+2] = clamp(b * scale, 0.0, 1.0);
+}

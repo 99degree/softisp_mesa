@@ -1,0 +1,22 @@
+#version 460
+layout(local_size_x = 32, local_size_y = 8) in;
+layout(set = 0, binding = 0, std430) readonly buffer IB { float raw[]; };
+layout(set = 0, binding = 1, std430) buffer OB { float outbuf[]; };
+layout(push_constant) uniform P { int width; int height; int bayer_pattern; float _pad; };
+layout(set = 0, binding = 2, std430) readonly buffer GB { float blc[4]; float wb_gains[4]; };
+int channel(int y, int x) {
+    int p = bayer_pattern;
+    if (p == 0) { if ((y & 1) == 0) return (x & 1) == 0 ? 0 : 1; else return (x & 1) == 0 ? 2 : 3; }
+    else if (p == 1) { if ((y & 1) == 0) return (x & 1) == 0 ? 3 : 2; else return (x & 1) == 0 ? 1 : 0; }
+    else if (p == 2) { if ((y & 1) == 0) return (x & 1) == 0 ? 1 : 0; else return (x & 1) == 0 ? 3 : 2; }
+    else { if ((y & 1) == 0) return (x & 1) == 0 ? 2 : 3; else return (x & 1) == 0 ? 0 : 1; }
+}
+void main() {
+    int y = int(gl_GlobalInvocationID.y);
+    int x = int(gl_GlobalInvocationID.x);
+    if (y >= height || x >= width) return;
+    int ch = channel(y, x);
+    float val = raw[y * width + x];
+    float corrected = (val - blc[ch]) * wb_gains[ch];
+    outbuf[y * width + x] = clamp(corrected, 0.0, 1.0);
+}

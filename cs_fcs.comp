@@ -1,0 +1,29 @@
+#version 460
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, std430) readonly buffer IB { float rgb[]; };
+layout(set = 0, binding = 1, std430) buffer OB { float outbuf[]; };
+layout(push_constant) uniform P { int width; int height; float strength; float _pad; };
+float lum(int y, int x) {
+    if (y < 0 || y >= height || x < 0 || x >= width) return 0.0;
+    int idx = (y * width + x) * 3;
+    return 0.299*rgb[idx] + 0.587*rgb[idx+1] + 0.114*rgb[idx+2];
+}
+void main() {
+    int y = int(gl_GlobalInvocationID.y);
+    int x = int(gl_GlobalInvocationID.x);
+    if (y >= height || x >= width) return;
+    float e = 0.0;
+    for (int ky = -1; ky <= 1; ky++)
+        for (int kx = -2; kx <= 2; kx++) {
+            if (ky == 0 && kx == 0) e += lum(y+ky, x+kx) * 1.0;
+            else if ((kx & 1) == 0) e += lum(y+ky, x+kx) * (-0.125);
+        }
+    float es = clamp(abs(e) * strength * 0.125, 0.0, 1.0);
+    float att = 1.0 - es;
+    int idx = (y * width + x) * 3;
+    float r = rgb[idx], g = rgb[idx+1], b = rgb[idx+2];
+    float l = 0.299*r + 0.587*g + 0.114*b;
+    outbuf[idx]   = l + (r - l) * att;
+    outbuf[idx+1] = l + (g - l) * att;
+    outbuf[idx+2] = l + (b - l) * att;
+}

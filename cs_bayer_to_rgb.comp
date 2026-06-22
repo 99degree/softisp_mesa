@@ -1,0 +1,47 @@
+#version 460
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, std430) readonly buffer IB { float bayer[]; };
+layout(set = 0, binding = 1, std430) buffer OB { float rgb[]; };
+layout(push_constant) uniform P { int width; int height; int bayer_pattern; float _pad; };
+bool is_red(int y, int x)    { return (y % 2 == 1) && (x % 2 == 1); }
+bool is_green_r(int y, int x){ return (y % 2 == 1) && (x % 2 == 0); }
+bool is_green_b(int y, int x){ return (y % 2 == 0) && (x % 2 == 1); }
+bool is_blue(int y, int x)   { return (y % 2 == 0) && (x % 2 == 0); }
+float ld(int y, int x) {
+    if (y < 0 || y >= height || x < 0 || x >= width) return 0.0;
+    return bayer[y * width + x];
+}
+void main() {
+    int y = int(gl_GlobalInvocationID.y);
+    int x = int(gl_GlobalInvocationID.x);
+    if (y >= height || x >= width) return;
+    int idx = (y * width + x) * 3;
+    float r, g, b;
+    float dh = abs(ld(y, x-1) - ld(y, x+1));
+    float dv = abs(ld(y-1, x) - ld(y+1, x));
+    if (is_red(y, x)) {
+        r = ld(y, x);
+        float g_h = (ld(y, x-1) + ld(y, x+1)) / 2.0;
+        float g_v = (ld(y-1, x) + ld(y+1, x)) / 2.0;
+        g = (dh < dv) ? g_h : ((dv < dh) ? g_v : (g_h + g_v) / 2.0);
+        b = (ld(y-1, x-1) + ld(y-1, x+1) + ld(y+1, x-1) + ld(y+1, x+1)) / 4.0;
+    } else if (is_blue(y, x)) {
+        b = ld(y, x);
+        float g_h = (ld(y, x-1) + ld(y, x+1)) / 2.0;
+        float g_v = (ld(y-1, x) + ld(y+1, x)) / 2.0;
+        g = (dh < dv) ? g_h : ((dv < dh) ? g_v : (g_h + g_v) / 2.0);
+        r = (ld(y-1, x-1) + ld(y-1, x+1) + ld(y+1, x-1) + ld(y+1, x+1)) / 4.0;
+    } else {
+        g = ld(y, x);
+        if (is_green_r(y, x)) {
+            r = (ld(y, x-1) + ld(y, x+1)) / 2.0;
+            b = (ld(y-1, x) + ld(y+1, x)) / 2.0;
+        } else {
+            b = (ld(y, x-1) + ld(y, x+1)) / 2.0;
+            r = (ld(y-1, x) + ld(y+1, x)) / 2.0;
+        }
+    }
+    rgb[idx] = clamp(r, 0.0, 1.0);
+    rgb[idx+1] = clamp(g, 0.0, 1.0);
+    rgb[idx+2] = clamp(b, 0.0, 1.0);
+}

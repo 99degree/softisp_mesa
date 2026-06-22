@@ -1,0 +1,16 @@
+#version 460
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, std430) readonly buffer IB { float rgb[]; };
+layout(set = 0, binding = 1, std430) buffer OB { float outbuf[]; };
+layout(push_constant) uniform P { int width; int height; int _pad0; float _pad1; };
+layout(set = 0, binding = 2, std430) readonly buffer MB { float ccm[9]; };
+void main() {
+    int y = int(gl_GlobalInvocationID.y);
+    int x = int(gl_GlobalInvocationID.x);
+    if (y >= height || x >= width) return;
+    int idx = (y * width + x) * 3;
+    float r = rgb[idx], g = rgb[idx+1], b = rgb[idx+2];
+    outbuf[idx]   = clamp(ccm[0]*r + ccm[1]*g + ccm[2]*b, 0.0, 1.0);
+    outbuf[idx+1] = clamp(ccm[3]*r + ccm[4]*g + ccm[5]*b, 0.0, 1.0);
+    outbuf[idx+2] = clamp(ccm[6]*r + ccm[7]*g + ccm[8]*b, 0.0, 1.0);
+}

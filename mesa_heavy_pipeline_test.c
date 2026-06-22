@@ -303,75 +303,6 @@ static ComputeStage stage_create(VulkanCtx *ctx,
 }
 
 /* Bind buffers to a stage's descriptor set */
-static void stage_bind(VulkanCtx *ctx, ComputeStage *s, GpuBuf *bufs, int count) {
-    s->bind_bufs = bufs;
-    s->bind_count = count;
-    VkDescriptorBufferInfo *dbi = malloc(count * sizeof(VkDescriptorBufferInfo));
-    VkWriteDescriptorSet *wds = malloc(count * sizeof(VkWriteDescriptorSet));
-
-    for (int i = 0; i < count; i++) {
-        dbi[i] = (VkDescriptorBufferInfo){ bufs[i].buf, 0, VK_WHOLE_SIZE };
-        wds[i] = (VkWriteDescriptorSet){
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = s->ds, .dstBinding = (uint32_t)i,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .pBufferInfo = &dbi[i],
-        };
-    }
-    vkUpdateDescriptorSets(ctx->dev, (uint32_t)count, wds, 0, NULL);
-    free(dbi);
-    free(wds);
-}
-
-/* Record and submit a dispatch call. Returns execution time in seconds. */
-static double stage_dispatch(VulkanCtx *ctx, ComputeStage *s,
-                              uint32_t groups_x, uint32_t groups_y,
-                              const void *push_data, size_t push_size)
-{
-    VkCommandBufferAllocateInfo cbai = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = ctx->pool,
-        .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
-        .commandBufferCount = 1,
-    };
-    VkCommandBuffer cb;
-    VK_CHECK(vkAllocateCommandBuffers(ctx->dev, &cbai, &cb), "vkAllocateCommandBuffers");
-
-    VkCommandBufferBeginInfo cbbi = {
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-    };
-    VK_CHECK(vkBeginCommandBuffer(cb, &cbbi), "vkBeginCommandBuffer");
-
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s->pipeline);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, s->pl,
-                            0, 1, &s->ds, 0, NULL);
-    if (push_data && push_size > 0)
-        vkCmdPushConstants(cb, s->pl,
-            VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)push_size, push_data);
-    vkCmdDispatch(cb, groups_x, groups_y, 1);
-
-    VK_CHECK(vkEndCommandBuffer(cb), "vkEndCommandBuffer");
-
-    VkFenceCreateInfo fci = { .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-    VkFence fence;
-    VK_CHECK(vkCreateFence(ctx->dev, &fci, NULL, &fence), "vkCreateFence");
-
-    double t0 = now_sec();
-    VkSubmitInfo si = {
-        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-        .commandBufferCount = 1, .pCommandBuffers = &cb,
-    };
-    VK_CHECK(vkQueueSubmit(ctx->queue, 1, &si, fence), "vkQueueSubmit");
-    VK_CHECK(vkWaitForFences(ctx->dev, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-    double dt = now_sec() - t0;
-
-    vkDestroyFence(ctx->dev, fence, NULL);
-    vkFreeCommandBuffers(ctx->dev, ctx->pool, 1, &cb);
-    return dt;
-}
-
 static float half_to_float(uint16_t h) {
     uint32_t sign = (h >> 15) & 1;
     uint32_t exp  = (h >> 10) & 0x1f;
@@ -484,124 +415,6 @@ static void build_gamma_lut(float *lut, int n, float gamma) {
 /* ------------------------------------------------------------------ */
 /*  Per-stage run functions                                            */
 /* ------------------------------------------------------------------ */
-
-static double run_blc_wb(VulkanCtx *ctx, ComputeStage *s,
-                          GpuBuf *raw_buf, GpuBuf *out_buf,
-                          int w, int h, int bpat, int abits)
-{
-    /* Gains buffer: 4 blc values + 4 wb gains */
-    float gains[8] = { 0.01f, 0.01f, 0.01f, 0.02f,  /* BLC: R,Gr,Gb,B */
-                       1.8f,  1.0f,  1.0f,  2.2f };  /* WB gains */
-    GpuBuf gb = gpu_buf(ctx, sizeof(gains),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    gpu_buf_upload(ctx, &gb, gains);
-
-    GpuBuf bindings[] = { *raw_buf, *out_buf, gb };
-    stage_bind(ctx, s, bindings, 3);
-
-    PC_Bayer pc = { w, h, bpat, abits };
-    double dt = stage_dispatch(ctx, s, (w + 31) / 32, (h + 7) / 8, &pc, sizeof(pc));
-
-    gpu_buf_free(ctx, &gb);
-    return dt;
-}
-
-static double run_demosaic(VulkanCtx *ctx, ComputeStage *s,
-                            GpuBuf *in_buf, GpuBuf *out_buf,
-                            int w, int h, int bpat, int abits)
-{
-    GpuBuf bindings[] = { *in_buf, *out_buf };
-    stage_bind(ctx, s, bindings, 2);
-    PC_Bayer pc = { w, h, bpat, abits };
-    return stage_dispatch(ctx, s, (w + 15) / 16, (h + 15) / 16, &pc, sizeof(pc));
-}
-
-static double run_ccm(VulkanCtx *ctx, ComputeStage *s,
-                       GpuBuf *in_buf, GpuBuf *out_buf,
-                       int w, int h)
-{
-    /* Identity-ish CCM matrix (slightly warm) */
-    float ccm[9] = { 1.2f, -0.1f, -0.1f,
-                    -0.1f,  1.3f, -0.2f,
-                    -0.1f, -0.1f,  1.2f };
-    GpuBuf mb = gpu_buf(ctx, sizeof(ccm),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    gpu_buf_upload(ctx, &mb, ccm);
-
-    GpuBuf bindings[] = { *in_buf, *out_buf, mb };
-    stage_bind(ctx, s, bindings, 3);
-
-    PC_WHPad pc = { w, h, 0, 0 };
-    double dt = stage_dispatch(ctx, s, (w + 15) / 16, (h + 15) / 16, &pc, sizeof(pc));
-
-    gpu_buf_free(ctx, &mb);
-    return dt;
-}
-
-static double run_tone(VulkanCtx *ctx, ComputeStage *s,
-                        GpuBuf *in_buf, GpuBuf *out_buf,
-                        int w, int h)
-{
-    /* Build gamma LUT */
-    float lut[4096];
-    build_gamma_lut(lut, 4096, 1.0f / 2.2f);
-    GpuBuf lb = gpu_buf(ctx, sizeof(lut),
-        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    gpu_buf_upload(ctx, &lb, lut);
-
-    GpuBuf bindings[] = { *in_buf, *out_buf, lb };
-    stage_bind(ctx, s, bindings, 3);
-
-    PC_Tone pc = { w, h, 1.0f/2.2f, 1.2f, 0.05f, 1.3f };
-    double dt = stage_dispatch(ctx, s, (w + 15) / 16, (h + 15) / 16, &pc, sizeof(pc));
-
-    gpu_buf_free(ctx, &lb);
-    return dt;
-}
-
-static double run_fcs(VulkanCtx *ctx, ComputeStage *s,
-                       GpuBuf *in_buf, GpuBuf *out_buf,
-                       int w, int h)
-{
-    GpuBuf bindings[] = { *in_buf, *out_buf };
-    stage_bind(ctx, s, bindings, 2);
-    PC_Strength pc = { w, h, 1.0f, 0 };
-    return stage_dispatch(ctx, s, (w + 15) / 16, (h + 15) / 16, &pc, sizeof(pc));
-}
-
-static double run_ldci(VulkanCtx *ctx,
-                        ComputeStage *s_h, ComputeStage *s_v,
-                        GpuBuf *in_buf, GpuBuf *horiz_buf, GpuBuf *out_buf,
-                        int w, int h)
-{
-    /* Pass 1: horizontal box sum of luminance */
-    GpuBuf bind_h[] = { *in_buf, *horiz_buf };
-    stage_bind(ctx, s_h, bind_h, 2);
-    PC_Ldci pc = { w, h, 0.5f, 4 };
-    double t1 = stage_dispatch(ctx, s_h, (w + 15) / 16, (h + 15) / 16, &pc, sizeof(pc));
-
-    /* Pass 2: vertical box sum + LDCI enhancement */
-    GpuBuf bind_v[] = { *in_buf, *horiz_buf, *out_buf };
-    stage_bind(ctx, s_v, bind_v, 3);
-    double t2 = stage_dispatch(ctx, s_v, (w + 15) / 16, (h + 15) / 16, &pc, sizeof(pc));
-
-    return t1 + t2;
-}
-
-static double run_ee(VulkanCtx *ctx, ComputeStage *s,
-                      GpuBuf *in_buf, GpuBuf *out_buf,
-                      int w, int h)
-{
-    GpuBuf bindings[] = { *in_buf, *out_buf };
-    stage_bind(ctx, s, bindings, 2);
-    PC_Strength pc = { w, h, 0.3f, 0 };
-    return stage_dispatch(ctx, s, (w + 15) / 16, (h + 15) / 16, &pc, sizeof(pc));
-}
-
-/* ------------------------------------------------------------------ */
 /*  Generate synthetic Bayer pattern (BGGR)                            */
 /* ------------------------------------------------------------------ */
 
@@ -671,7 +484,7 @@ static int validate_rgb(const float *rgb, int w, int h, const char *stage) {
 /* ------------------------------------------------------------------ */
 
 static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
-                                const char *label, int do_perf)
+                                const char *label, int do_perf, int abits)
 {
     printf("\n━━━ HEAVY Pipeline @ %s (%dx%d) ━━━\n", label, width, height);
 
@@ -834,7 +647,7 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     PC_WHPad pc_wh = {width, height, 0, 0};
     PC_Tone pc_tone = {width, height, 1.0f/2.2f, 1.2f, 0.05f, 1.3f};
     PC_Strength pc_strength = {width, height, 0.3f, 0};
-    PC_Strength pc_fcs_str = {width, height, 1.0f, 0};
+
     PC_Ldci pc_ldci = {width, height, 0.5f, 4};
     PC_Ldci pc_fcs_lh_pc = {width, height, 1.0f, 4}; /* fcs_strength=1.0, ldci_radius=4 */
 
@@ -1061,6 +874,157 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
         printf("  >>> %s: PASS (pipeline processed correctly)\n", label);
     else
         printf("  >>> %s: FAIL (errors=%d)\n", label, e);
+
+    /* ── Parallel Submission Throughput Test ── */
+    {
+        printf("\n  ── Parallel Submission Throughput ──\n");
+        int ns[] = {1, 2, 3, 4, 6};
+        int n_ns = 5;
+        int p_iters = 3;
+
+        /* Re-upload synthetic Bayer */
+        uint16_t *bayer_p = generate_bayer(width, height, bpat, abits);
+        gpu_buf_upload(ctx, &buf_bayer, bayer_p);
+
+        /* Per frame buffer set (size same as originals) */
+        VkDeviceSize bsz  = bayer_bytes;
+        VkDeviceSize rsz  = rgb_bytes;
+        VkDeviceSize r32s = rgb32_bytes;
+        VkDeviceSize hsz  = (VkDeviceSize)(width * height) * sizeof(float);
+        VkDeviceSize asz  = (VkDeviceSize)(width * height) * sizeof(uint32_t);
+
+        /* Reusable submit info */
+        VkSubmitInfo si = {.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,.commandBufferCount=1};
+        VkCommandBufferAllocateInfo ai = {.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=ctx->pool,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+        VkCommandBufferBeginInfo bi = {.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+        VkFenceCreateInfo fi = {.sType=VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VkMemoryBarrier mb = {.sType=VK_STRUCTURE_TYPE_MEMORY_BARRIER,.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT,.dstAccessMask=VK_ACCESS_SHADER_READ_BIT};
+
+        /* Allocate buffer pool for max N (6) */
+        int maxN = 6;
+        GpuBuf *pb = calloc(maxN, sizeof(GpuBuf)); /* bayer */
+        GpuBuf *pr1 = calloc(maxN, sizeof(GpuBuf));
+        GpuBuf *pr2 = calloc(maxN, sizeof(GpuBuf));
+        GpuBuf *pr32 = calloc(maxN, sizeof(GpuBuf));
+        GpuBuf *ph = calloc(maxN, sizeof(GpuBuf)); /* horiz */
+        GpuBuf *pa = calloc(maxN, sizeof(GpuBuf)); /* argb */
+        for (int i = 0; i < maxN; i++) {
+            pb[i] = gpu_buf(ctx, bsz, buf_usage, mem_flags);
+            pr1[i] = gpu_buf(ctx, rsz, buf_usage, mem_flags);
+            pr2[i] = gpu_buf(ctx, rsz, buf_usage, mem_flags);
+            pr32[i] = gpu_buf(ctx, r32s, buf_usage, mem_flags);
+            ph[i] = gpu_buf(ctx, hsz, buf_usage, mem_flags);
+            pa[i] = gpu_buf(ctx, asz, buf_usage, mem_flags);
+            gpu_buf_upload(ctx, &pb[i], bayer_p);
+        }
+        free(bayer_p);
+
+        /* For each N value, measure parallel throughput */
+        double single_ref = t_avg;
+        for (int ni = 0; ni < n_ns; ni++) {
+            int N = ns[ni];
+            if (N > maxN) continue;
+
+            /* Pre-allocate N CBs + N fences per run to avoid allocation in timed path */
+            VkCommandBuffer *cbs = malloc(N * sizeof(VkCommandBuffer));
+            VkFence *fences = malloc(N * sizeof(VkFence));
+
+            double t_batch = 0;
+            for (int run = 0; run < p_iters; run++) {
+                /* Record N command buffers, each processing one frame */
+                for (int f = 0; f < N; f++) {
+                    VK_CHECK(vkAllocateCommandBuffers(ctx->dev, &ai, &cbs[f]), "cb");
+                    VK_CHECK(vkBeginCommandBuffer(cbs[f], &bi), "begin");
+
+                    /* Update descriptors for this frame's buffers */
+                    {
+                        VkDescriptorBufferInfo d[]={{pb[f].buf,0,VK_WHOLE_SIZE},{pr1[f].buf,0,VK_WHOLE_SIZE},{gains_buf.buf,0,VK_WHOLE_SIZE}};
+                        VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_blc_wb.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_blc_wb.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_blc_wb.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[2]}};
+                        vkUpdateDescriptorSets(ctx->dev,3,w,0,NULL);
+                    }
+                    {
+                        VkDescriptorBufferInfo d[]={{pr1[f].buf,0,VK_WHOLE_SIZE},{pr32[f].buf,0,VK_WHOLE_SIZE}};
+                        VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_demo_f32.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_demo_f32.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]}};
+                        vkUpdateDescriptorSets(ctx->dev,2,w,0,NULL);
+                    }
+                    {
+                        VkDescriptorBufferInfo d[]={{pr32[f].buf,0,VK_WHOLE_SIZE},{pr2[f].buf,0,VK_WHOLE_SIZE},{ccm_buf.buf,0,VK_WHOLE_SIZE},{lut_buf.buf,0,VK_WHOLE_SIZE}};
+                        VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone_f32in.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone_f32in.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone_f32in.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[2]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone_f32in.ds,.dstBinding=3,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[3]}};
+                        vkUpdateDescriptorSets(ctx->dev,4,w,0,NULL);
+                    }
+                    {
+                        VkDescriptorBufferInfo d[]={{pr2[f].buf,0,VK_WHOLE_SIZE},{pr1[f].buf,0,VK_WHOLE_SIZE},{ph[f].buf,0,VK_WHOLE_SIZE}};
+                        VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs_lh.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs_lh.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs_lh.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[2]}};
+                        vkUpdateDescriptorSets(ctx->dev,3,w,0,NULL);
+                    }
+                    {
+                        VkDescriptorBufferInfo d[]={{pr1[f].buf,0,VK_WHOLE_SIZE},{ph[f].buf,0,VK_WHOLE_SIZE},{pr2[f].buf,0,VK_WHOLE_SIZE}};
+                        VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_v.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_v.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_v.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[2]}};
+                        vkUpdateDescriptorSets(ctx->dev,3,w,0,NULL);
+                    }
+                    {
+                        VkDescriptorBufferInfo d[]={{pr2[f].buf,0,VK_WHOLE_SIZE},{pr1[f].buf,0,VK_WHOLE_SIZE}};
+                        VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ee.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ee.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]}};
+                        vkUpdateDescriptorSets(ctx->dev,2,w,0,NULL);
+                    }
+                    {
+                        VkDescriptorBufferInfo d[]={{pr1[f].buf,0,VK_WHOLE_SIZE},{pa[f].buf,0,VK_WHOLE_SIZE}};
+                        VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_argb.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_argb.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]}};
+                        vkUpdateDescriptorSets(ctx->dev,2,w,0,NULL);
+                    }
+
+                    batch_cmd(cbs[f], &f_blc, (width+31)/32, (height+7)/8, &pc_bayer);
+                    vkCmdPipelineBarrier(cbs[f], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+                    batch_cmd(cbs[f], &f_demo_f32, (width+15)/16, (height+15)/16, &pc_bayer);
+                    vkCmdPipelineBarrier(cbs[f], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+                    batch_cmd(cbs[f], &f_ccm_tone_f32in, (width+15)/16, (height+15)/16, &pc_tone);
+                    vkCmdPipelineBarrier(cbs[f], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+                    batch_cmd(cbs[f], &f_fcs_lh, (width+15)/16, (height+15)/16, &pc_fcs_lh_pc);
+                    vkCmdPipelineBarrier(cbs[f], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+                    batch_cmd(cbs[f], &f_lv, (width+15)/16, (height+15)/16, &pc_ldci);
+                    vkCmdPipelineBarrier(cbs[f], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+                    batch_cmd(cbs[f], &f_ee, (width+15)/16, (height+15)/16, &pc_strength);
+                    vkCmdPipelineBarrier(cbs[f], VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+                    batch_cmd(cbs[f], &f_argb, (width+15)/16, (height+15)/16, &pc_wh);
+
+                    VK_CHECK(vkEndCommandBuffer(cbs[f]), "end");
+                }
+
+                /* Submit all N command buffers, each with its own fence */
+                double t0 = now_sec();
+                for (int f = 0; f < N; f++) {
+                    VK_CHECK(vkCreateFence(ctx->dev, &fi, NULL, &fences[f]), "fence");
+                    si.pCommandBuffers = &cbs[f];
+                    VK_CHECK(vkQueueSubmit(ctx->queue, 1, &si, fences[f]), "submit");
+                }
+                for (int f = 0; f < N; f++) {
+                    vkWaitForFences(ctx->dev, 1, &fences[f], VK_TRUE, UINT64_MAX);
+                    vkDestroyFence(ctx->dev, fences[f], NULL);
+                    vkFreeCommandBuffers(ctx->dev, ctx->pool, 1, &cbs[f]);
+                }
+                t_batch += now_sec() - t0;
+            }
+            t_batch /= p_iters;
+
+            double ideal = single_ref * N;
+            double speedup = ideal / t_batch;
+            printf("  N=%2d: %8.4f ms batch  %7.2f us/frame  %6.2f FPS  speedup vs sequential: %.2f×\n",
+                   N, t_batch * 1e3, t_batch / N * 1e6, N / t_batch, speedup);
+            free(cbs);
+            free(fences);
+        }
+
+        /* Cleanup parallel buffers */
+        for (int i = 0; i < maxN; i++) {
+            gpu_buf_free(ctx, &pb[i]);
+            gpu_buf_free(ctx, &pr1[i]);
+            gpu_buf_free(ctx, &pr2[i]);
+            gpu_buf_free(ctx, &pr32[i]);
+            gpu_buf_free(ctx, &ph[i]);
+            gpu_buf_free(ctx, &pa[i]);
+        }
+        free(pb); free(pr1); free(pr2); free(pr32); free(ph); free(pa);
+    }
 
     /* Cleanup */
     free(f16);

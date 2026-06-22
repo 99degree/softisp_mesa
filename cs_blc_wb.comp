@@ -1,6 +1,7 @@
 #version 460
+#extension GL_EXT_shader_16bit_storage : require
 layout(local_size_x = 32, local_size_y = 8) in;
-layout(set = 0, binding = 0, std430) readonly buffer IB { float raw[]; };
+layout(set = 0, binding = 0, std430) readonly buffer IB { uint16_t raw[]; };
 layout(set = 0, binding = 1, std430) buffer OB { float outbuf[]; };
 layout(push_constant) uniform P { int width; int height; int bayer_pattern; float _pad; };
 layout(set = 0, binding = 2, std430) readonly buffer GB { float blc[4]; float wb_gains[4]; };
@@ -16,7 +17,7 @@ void main() {
     int x = int(gl_GlobalInvocationID.x);
     if (y >= height || x >= width) return;
     int ch = channel(y, x);
-    float val = raw[y * width + x];
+    float val = float(uint(raw[y * width + x])) / 65535.0;
     float corrected = (val - blc[ch]) * wb_gains[ch];
     outbuf[y * width + x] = clamp(corrected, 0.0, 1.0);
 }

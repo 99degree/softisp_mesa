@@ -35,6 +35,7 @@
 #include "cs_ccm_tone_spv.h"
 #include "cs_fcs_spv.h"
 #include "cs_fcs_ldci_h_spv.h"
+#include "cs_rgb_to_argb_spv.h"
 #include "cs_ldci_h_spv.h"
 #include "cs_ldci_v_spv.h"
 #include "cs_ee_spv.h"
@@ -127,9 +128,11 @@ static VulkanCtx vk_init(int prefer_gpu) {
         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = ctx.qfi, .queueCount = 1, .pQueuePriorities = &prio,
     };
+    const char *exts[] = { "VK_KHR_16bit_storage" };
     VkDeviceCreateInfo dci = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1, .pQueueCreateInfos = &dqci,
+        .enabledExtensionCount = 1, .ppEnabledExtensionNames = exts,
     };
     VK_CHECK(vkCreateDevice(ctx.phys_dev, &dci, NULL, &ctx.dev), "vkCreateDevice");
     vkGetDeviceQueue(ctx.dev, ctx.qfi, 0, &ctx.queue);
@@ -579,29 +582,24 @@ static double run_ee(VulkanCtx *ctx, ComputeStage *s,
 /*  Generate synthetic Bayer pattern (BGGR)                            */
 /* ------------------------------------------------------------------ */
 
-static float *generate_bayer(int w, int h, int pattern) {
-    float *b = malloc(w * h * sizeof(float));
+/* Generate Bayer pattern as uint16 (0-65535 range, normalized to [0,1] in shader) */
+static uint16_t *generate_bayer(int w, int h, int pattern) {
+    uint16_t *b = malloc(w * h * sizeof(uint16_t));
     for (int y = 0; y < h; y++) {
         for (int x = 0; x < w; x++) {
-            /* Colorful gradient + checkerboard pattern */
             float r = (float)x / (float)w;
             float g = (float)y / (float)h;
             float bl = 0.5f + 0.5f * sinf((float)(x + y) * 0.01f);
-
+            float val;
             if (pattern == 1) { /* BGGR */
-                if (y % 2 == 0)
-                    b[y * w + x] = (x % 2 == 0) ? bl : g;
-                else
-                    b[y * w + x] = (x % 2 == 0) ? g : r;
-            } else { /* RGGB default */
-                if (y % 2 == 0)
-                    b[y * w + x] = (x % 2 == 0) ? r : g;
-                else
-                    b[y * w + x] = (x % 2 == 0) ? g : bl;
+                if (y % 2 == 0) val = (x % 2 == 0) ? bl : g;
+                else            val = (x % 2 == 0) ? g : r;
+            } else {
+                if (y % 2 == 0) val = (x % 2 == 0) ? r : g;
+                else            val = (x % 2 == 0) ? g : bl;
             }
-            /* Clamp to [0,1] */
-            if (b[y * w + x] < 0) b[y * w + x] = 0;
-            if (b[y * w + x] > 1) b[y * w + x] = 1;
+            if (val < 0) val = 0; if (val > 1) val = 1;
+            b[y * w + x] = (uint16_t)(val * 65535.0f + 0.5f);
         }
     }
     return b;
@@ -656,7 +654,7 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     int bpat = 1; /* BGGR */
     int n_bayer = width * height;
     int n_rgb   = width * height * 3;
-    VkDeviceSize bayer_bytes = n_bayer * sizeof(float);
+    VkDeviceSize bayer_bytes = n_bayer * sizeof(uint16_t);
     VkDeviceSize rgb_bytes   = n_rgb * sizeof(float);
 
     /* Create buffers */
@@ -670,9 +668,10 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     GpuBuf buf_rgb1   = gpu_buf(ctx, rgb_bytes,   buf_usage, mem_flags);
     GpuBuf buf_rgb2   = gpu_buf(ctx, rgb_bytes,   buf_usage, mem_flags);
     GpuBuf buf_horiz  = gpu_buf(ctx, n_bayer * sizeof(float), buf_usage, mem_flags);
+    GpuBuf buf_argb   = gpu_buf(ctx, n_bayer * sizeof(uint32_t), buf_usage, mem_flags);
 
     /* Upload synthetic Bayer */
-    float *bayer = generate_bayer(width, height, bpat);
+    uint16_t *bayer = generate_bayer(width, height, bpat);
     gpu_buf_upload(ctx, &buf_bayer, bayer);
 
     /* Create all compute stages */
@@ -686,6 +685,7 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     ComputeStage st_ldci_h  = stage_create(ctx, cs_ldci_h_spv, cs_ldci_h_spv_len, 2);
     ComputeStage st_ldci_v  = stage_create(ctx, cs_ldci_v_spv, cs_ldci_v_spv_len, 3);
     ComputeStage st_ee      = stage_create(ctx, cs_ee_spv, cs_ee_spv_len, 2);
+    ComputeStage st_argb    = stage_create(ctx, cs_rgb_to_argb_spv, cs_rgb_to_argb_spv_len, 2);
 
     /* Pre-create constant data buffers (never recreated in timed loop) */
     float gains[8] = { 0.01f, 0.01f, 0.01f, 0.02f, 1.8f, 1.0f, 1.0f, 2.2f };
@@ -804,6 +804,7 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     FastStage f_lh = {st_ldci_h.ds, st_ldci_h.pl, st_ldci_h.pipeline, sizeof(PC_Ldci)};
     FastStage f_lv = {st_ldci_v.ds, st_ldci_v.pl, st_ldci_v.pipeline, sizeof(PC_Ldci)};
     FastStage f_ee = {st_ee.ds, st_ee.pl, st_ee.pipeline, sizeof(PC_Strength)};
+    FastStage f_argb = {st_argb.ds, st_argb.pl, st_argb.pipeline, sizeof(PC_WHPad)};
 
     PC_Bayer pc_bayer = {width, height, bpat, 0};
     PC_WHPad pc_wh = {width, height, 0, 0};
@@ -974,6 +975,15 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
             };
             vkUpdateDescriptorSets(ctx->dev, 2, wds, 0, NULL);
         }
+        {
+            /* ARGB pack: src (EE output) -> buf_argb */
+            VkDescriptorBufferInfo dbi[] = {{src->buf,0,VK_WHOLE_SIZE},{buf_argb.buf,0,VK_WHOLE_SIZE}};
+            VkWriteDescriptorSet wds[] = {
+                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_argb.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
+                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_argb.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
+            };
+            vkUpdateDescriptorSets(ctx->dev, 2, wds, 0, NULL);
+        }
 
         /* Record all dispatches into ONE command buffer with barriers */
         VkCommandBuffer cb;
@@ -991,6 +1001,8 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
         batch_cmd(cb, &f_lv, (width+15)/16, (height+15)/16, &pc_ldci);
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, NULL, 0, NULL);
         batch_cmd(cb, &f_ee, (width+15)/16, (height+15)/16, &pc_strength);
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, NULL, 0, NULL);
+        batch_cmd(cb, &f_argb, (width+15)/16, (height+15)/16, &pc_wh);
 
         double t_iter = batch_submit(ctx, cb);
         t_total += t_iter;
@@ -1016,7 +1028,7 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
 
     /* Verify flat-gray region produces balanced output */
     /* Upload flat 50% gray Bayer, process, check balance */
-    for (int i = 0; i < n_bayer; i++) bayer[i] = 0.5f;
+    for (int i = 0; i < n_bayer; i++) bayer[i] = 32768; /* 0.5 in uint16 */
     gpu_buf_upload(ctx, &buf_bayer, bayer);
 
     /* Run full pipeline on flat gray */
@@ -1061,10 +1073,12 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     stage_destroy(ctx, &st_ldci_h);
     stage_destroy(ctx, &st_ldci_v);
     stage_destroy(ctx, &st_ee);
+    stage_destroy(ctx, &st_argb);
     gpu_buf_free(ctx, &buf_bayer);
     gpu_buf_free(ctx, &buf_rgb1);
     gpu_buf_free(ctx, &buf_rgb2);
     gpu_buf_free(ctx, &buf_horiz);
+    gpu_buf_free(ctx, &buf_argb);
     gpu_buf_free(ctx, &gains_buf);
     gpu_buf_free(ctx, &ccm_buf);
     gpu_buf_free(ctx, &lut_buf);

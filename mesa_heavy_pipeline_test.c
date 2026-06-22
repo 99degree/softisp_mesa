@@ -32,7 +32,9 @@
 #include "cs_blc_wb_spv.h"
 #include "cs_ccm_spv.h"
 #include "cs_tone_spv.h"
+#include "cs_ccm_tone_spv.h"
 #include "cs_fcs_spv.h"
+#include "cs_fcs_ldci_h_spv.h"
 #include "cs_ldci_h_spv.h"
 #include "cs_ldci_v_spv.h"
 #include "cs_ee_spv.h"
@@ -367,6 +369,8 @@ static double stage_dispatch(VulkanCtx *ctx, ComputeStage *s,
 /* Fast dispatch: uses pre-computed descriptor set, no malloc */
 typedef struct { VkDescriptorSet set; VkPipelineLayout pl; VkPipeline pipe; int push_size; } FastStage;
 
+static double batch_submit(VulkanCtx *ctx, VkCommandBuffer cb);
+
 static void batch_cmd(VkCommandBuffer cb, FastStage *s,
                        int groups_x, int groups_y,
                        const void *push_data)
@@ -376,18 +380,6 @@ static void batch_cmd(VkCommandBuffer cb, FastStage *s,
     if (push_data && s->push_size > 0)
         vkCmdPushConstants(cb, s->pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, (uint32_t)s->push_size, push_data);
     vkCmdDispatch(cb, groups_x, groups_y, 1);
-}
-
-static void batch_barrier(VkCommandBuffer cb) {
-    VkMemoryBarrier mb = {
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
-    };
-    vkCmdPipelineBarrier(cb,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        0, 1, &mb, 0, NULL, 0, NULL);
 }
 
 /* Single dispatch (convenience wrapper for warmup/non-timed use) */
@@ -688,7 +680,9 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     ComputeStage st_demo    = stage_create(ctx, cs_bayer_to_rgb_spv, cs_bayer_to_rgb_spv_len, 2);
     ComputeStage st_ccm     = stage_create(ctx, cs_ccm_spv, cs_ccm_spv_len, 3);
     ComputeStage st_tone    = stage_create(ctx, cs_tone_spv, cs_tone_spv_len, 3);
+    ComputeStage st_ccm_tone= stage_create(ctx, cs_ccm_tone_spv, cs_ccm_tone_spv_len, 4);
     ComputeStage st_fcs     = stage_create(ctx, cs_fcs_spv, cs_fcs_spv_len, 2);
+    ComputeStage st_fcs_lh  = stage_create(ctx, cs_fcs_ldci_h_spv, cs_fcs_ldci_h_spv_len, 3);
     ComputeStage st_ldci_h  = stage_create(ctx, cs_ldci_h_spv, cs_ldci_h_spv_len, 2);
     ComputeStage st_ldci_v  = stage_create(ctx, cs_ldci_v_spv, cs_ldci_v_spv_len, 3);
     ComputeStage st_ee      = stage_create(ctx, cs_ee_spv, cs_ee_spv_len, 2);
@@ -804,7 +798,9 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     FastStage f_demo = {st_demo.ds, st_demo.pl, st_demo.pipeline, sizeof(PC_Bayer)};
     FastStage f_ccm = {st_ccm.ds, st_ccm.pl, st_ccm.pipeline, sizeof(PC_WHPad)};
     FastStage f_tone = {st_tone.ds, st_tone.pl, st_tone.pipeline, sizeof(PC_Tone)};
+    FastStage f_ccm_tone = {st_ccm_tone.ds, st_ccm_tone.pl, st_ccm_tone.pipeline, sizeof(PC_Tone)};
     FastStage f_fcs = {st_fcs.ds, st_fcs.pl, st_fcs.pipeline, sizeof(PC_Strength)};
+    FastStage f_fcs_lh = {st_fcs_lh.ds, st_fcs_lh.pl, st_fcs_lh.pipeline, sizeof(PC_Ldci)};
     FastStage f_lh = {st_ldci_h.ds, st_ldci_h.pl, st_ldci_h.pipeline, sizeof(PC_Ldci)};
     FastStage f_lv = {st_ldci_v.ds, st_ldci_v.pl, st_ldci_v.pipeline, sizeof(PC_Ldci)};
     FastStage f_ee = {st_ee.ds, st_ee.pl, st_ee.pipeline, sizeof(PC_Strength)};
@@ -815,6 +811,7 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     PC_Strength pc_strength = {width, height, 0.3f, 0};
     PC_Strength pc_fcs_str = {width, height, 1.0f, 0};
     PC_Ldci pc_ldci = {width, height, 0.5f, 4};
+    PC_Ldci pc_fcs_lh_pc = {width, height, 1.0f, 4}; /* fcs_strength=1.0, ldci_radius=4 */
 
     /* Warm-up: run all stages once (not timed) - fix descriptors first */
     {
@@ -904,8 +901,6 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
 
     /* Timed runs - no buffer creation, no malloc, just dispatch */
     int iters = do_perf ? 10 : 3;
-    double t_blc_wb = 0, t_demo = 0, t_ccm = 0, t_tone = 0;
-    double t_fcs = 0, t_ldci = 0, t_ee = 0;
     double t_total = 0;
 
     /* Pre-allocate 2 command buffers for ping-pong batch submission */
@@ -942,36 +937,23 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
             vkUpdateDescriptorSets(ctx->dev, 2, wds, 0, NULL);
         }
         {
-            VkDescriptorBufferInfo dbi[] = {{dst->buf,0,VK_WHOLE_SIZE},{src->buf,0,VK_WHOLE_SIZE},{ccm_buf.buf,0,VK_WHOLE_SIZE}};
+            /* Fused CCM+Tone: dst -> src, with CCM matrix + gamma LUT */
+            VkDescriptorBufferInfo dbi[] = {{dst->buf,0,VK_WHOLE_SIZE},{src->buf,0,VK_WHOLE_SIZE},{ccm_buf.buf,0,VK_WHOLE_SIZE},{lut_buf.buf,0,VK_WHOLE_SIZE}};
             VkWriteDescriptorSet wds[] = {
-                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
-                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
-                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[2]},
+                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
+                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
+                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[2]},
+                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone.ds,.dstBinding=3,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[3]},
             };
             vkUpdateDescriptorSets(ctx->dev, 3, wds, 0, NULL);
         }
         {
-            VkDescriptorBufferInfo dbi[] = {{src->buf,0,VK_WHOLE_SIZE},{dst->buf,0,VK_WHOLE_SIZE},{lut_buf.buf,0,VK_WHOLE_SIZE}};
+            /* Fused FCS+LDCI_H: dst -> src + horiz */
+            VkDescriptorBufferInfo dbi[] = {{dst->buf,0,VK_WHOLE_SIZE},{src->buf,0,VK_WHOLE_SIZE},{buf_horiz.buf,0,VK_WHOLE_SIZE}};
             VkWriteDescriptorSet wds[] = {
-                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_tone.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
-                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_tone.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
-                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_tone.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[2]},
-            };
-            vkUpdateDescriptorSets(ctx->dev, 3, wds, 0, NULL);
-        }
-        {
-            VkDescriptorBufferInfo dbi[] = {{dst->buf,0,VK_WHOLE_SIZE},{src->buf,0,VK_WHOLE_SIZE}};
-            VkWriteDescriptorSet wds[] = {
-                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
-                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
-            };
-            vkUpdateDescriptorSets(ctx->dev, 2, wds, 0, NULL);
-        }
-        {
-            VkDescriptorBufferInfo dbi[] = {{src->buf,0,VK_WHOLE_SIZE},{buf_horiz.buf,0,VK_WHOLE_SIZE}};
-            VkWriteDescriptorSet wds[] = {
-                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_h.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
-                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_h.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
+                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs_lh.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
+                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs_lh.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
+                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs_lh.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[2]},
             };
             vkUpdateDescriptorSets(ctx->dev, 2, wds, 0, NULL);
         }
@@ -1002,37 +984,23 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, NULL, 0, NULL);
         batch_cmd(cb, &f_demo, (width+15)/16, (height+15)/16, &pc_bayer);
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, NULL, 0, NULL);
-        batch_cmd(cb, &f_ccm, (width+15)/16, (height+15)/16, &pc_wh);
+        batch_cmd(cb, &f_ccm_tone, (width+15)/16, (height+15)/16, &pc_tone);
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, NULL, 0, NULL);
-        batch_cmd(cb, &f_tone, (width+15)/16, (height+15)/16, &pc_tone);
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, NULL, 0, NULL);
-        batch_cmd(cb, &f_fcs, (width+15)/16, (height+15)/16, &pc_fcs_str);
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, NULL, 0, NULL);
-        batch_cmd(cb, &f_lh, (width+15)/16, (height+15)/16, &pc_ldci);
+        batch_cmd(cb, &f_fcs_lh, (width+15)/16, (height+15)/16, &pc_fcs_lh_pc);
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, NULL, 0, NULL);
         batch_cmd(cb, &f_lv, (width+15)/16, (height+15)/16, &pc_ldci);
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, NULL, 0, NULL);
         batch_cmd(cb, &f_ee, (width+15)/16, (height+15)/16, &pc_strength);
 
         double t_iter = batch_submit(ctx, cb);
-        t_blc_wb += t_iter / 9.0;  /* distribute time evenly across stages */
+        t_total += t_iter;
     }
 
-    /* Average per-stage times from the divider */
-    t_demo = t_ccm = t_tone = t_fcs = t_ldci = t_ee = t_blc_wb;
-    t_total = t_blc_wb;
-
+    double t_avg = t_total / iters;
     int mpix = width * height;
-    printf("\n  Per-Block Timing (avg of %d runs, batched dispatches):\n", iters);
-    printf("  %-18s %8.4f ms  %8.2f MP/s\n", "BLC/WB",   t_blc_wb*1e3, mpix/t_blc_wb/1e6);
-    printf("  %-18s %8.4f ms  %8.2f MP/s\n", "Demosaic", t_demo*1e3,   mpix/t_demo/1e6);
-    printf("  %-18s %8.4f ms  %8.2f MP/s\n", "CCM",      t_ccm*1e3,    mpix/t_ccm/1e6);
-    printf("  %-18s %8.4f ms  %8.2f MP/s\n", "Tone",     t_tone*1e3,   mpix/t_tone/1e6);
-    printf("  %-18s %8.4f ms  %8.2f MP/s\n", "FCS",      t_fcs*1e3,    mpix/t_fcs/1e6);
-    printf("  %-18s %8.4f ms  %8.2f MP/s\n", "LDCI",     t_ldci*1e3,   mpix/t_ldci/1e6);
-    printf("  %-18s %8.4f ms  %8.2f MP/s\n", "EE",       t_ee*1e3,     mpix/t_ee/1e6);
-    printf("  %-18s %8.4f ms  %8.2f MP/s\n", "TOTAL",    t_total*1e3,  mpix/t_total/1e6);
-    printf("  Frames/sec (est): %.1f\n", 1.0 / t_total);
+    printf("\n  Batched Pipeline Timing (avg of %d runs):\n", iters);
+    printf("  %-18s %8.4f ms  %8.2f MP/s\n", "TOTAL (batched)", t_avg*1e3, mpix/t_avg/1e6);
+    printf("  Frames/sec (est): %.1f\n", 1.0 / t_avg);
 
     /* Validate each stage output */
     printf("\n  Validation:\n");
@@ -1087,7 +1055,9 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     stage_destroy(ctx, &st_demo);
     stage_destroy(ctx, &st_ccm);
     stage_destroy(ctx, &st_tone);
+    stage_destroy(ctx, &st_ccm_tone);
     stage_destroy(ctx, &st_fcs);
+    stage_destroy(ctx, &st_fcs_lh);
     stage_destroy(ctx, &st_ldci_h);
     stage_destroy(ctx, &st_ldci_v);
     stage_destroy(ctx, &st_ee);

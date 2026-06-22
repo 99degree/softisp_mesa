@@ -1,0 +1,33 @@
+#version 460
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, std430) readonly buffer IB { float rgb[]; };
+layout(set = 0, binding = 1, std430) buffer OB { float outbuf[]; };
+layout(set = 0, binding = 2, std430) readonly buffer MB { float ccm[9]; };
+layout(set = 0, binding = 3, std430) readonly buffer LB { float lut[4096]; };
+layout(push_constant) uniform P {
+    int width; int height; float gamma; float contrast; float brightness; float saturation;
+};
+void main() {
+    int y = int(gl_GlobalInvocationID.y);
+    int x = int(gl_GlobalInvocationID.x);
+    if (y >= height || x >= width) return;
+    int idx = (y * width + x) * 3;
+    float r = rgb[idx], g = rgb[idx+1], b = rgb[idx+2];
+    /* CCM 3x3 */
+    float r2 = clamp(ccm[0]*r + ccm[1]*g + ccm[2]*b, 0.0, 1.0);
+    float g2 = clamp(ccm[3]*r + ccm[4]*g + ccm[5]*b, 0.0, 1.0);
+    float b2 = clamp(ccm[6]*r + ccm[7]*g + ccm[8]*b, 0.0, 1.0);
+    /* Gamma LUT */
+    int li = int(clamp(r2, 0.0, 1.0) * 4095.0); r2 = lut[li];
+    li = int(clamp(g2, 0.0, 1.0) * 4095.0); g2 = lut[li];
+    li = int(clamp(b2, 0.0, 1.0) * 4095.0); b2 = lut[li];
+    /* Contrast + Brightness */
+    r2 = (r2 - 0.5) * contrast + 0.5 + brightness;
+    g2 = (g2 - 0.5) * contrast + 0.5 + brightness;
+    b2 = (b2 - 0.5) * contrast + 0.5 + brightness;
+    /* Saturation */
+    float luma = 0.299f*r2 + 0.587f*g2 + 0.114f*b2;
+    outbuf[idx]   = clamp(luma + (r2 - luma) * saturation, 0.0, 1.0);
+    outbuf[idx+1] = clamp(luma + (g2 - luma) * saturation, 0.0, 1.0);
+    outbuf[idx+2] = clamp(luma + (b2 - luma) * saturation, 0.0, 1.0);
+}

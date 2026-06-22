@@ -1,0 +1,46 @@
+#version 460
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, std430) readonly buffer IB { float rgb[]; };
+layout(set = 0, binding = 1, std430) buffer OB { float out_rgb[]; };
+layout(set = 0, binding = 2, std430) buffer HB { float horiz[]; };
+layout(push_constant) uniform P { int width; int height; float fcs_strength; int ldci_radius; };
+float lum_at(int y, int x) {
+    if (y < 0 || y >= height || x < 0 || x >= width) return 0.0;
+    int i = (y * width + x) * 3;
+    return 0.299f*rgb[i] + 0.587f*rgb[i+1] + 0.114f*rgb[i+2];
+}
+void main() {
+    int y = int(gl_GlobalInvocationID.y);
+    int x = int(gl_GlobalInvocationID.x);
+    if (y >= height || x >= width) return;
+    /* FCS: 3x5 Laplacian edge detection on luminance */
+    float e = 0.0;
+    for (int ky = -1; ky <= 1; ky++) {
+        for (int kx = -2; kx <= 2; kx++) {
+            float lv = lum_at(y+ky, x+kx);
+            if (ky == 0 && kx == 0) e += lv * 1.0;
+            else if ((kx & 1) == 0) e += lv * (-0.125);
+        }
+    }
+    float es = clamp(abs(e) * fcs_strength * 0.125, 0.0, 1.0);
+    float att = 1.0 - es;
+    int idx = (y * width + x) * 3;
+    float r = rgb[idx], g = rgb[idx+1], b = rgb[idx+2];
+    float l = 0.299f*r + 0.587f*g + 0.114f*b;
+    float r_fcs = clamp(l + (r - l) * att, 0.0, 1.0);
+    float g_fcs = clamp(l + (g - l) * att, 0.0, 1.0);
+    float b_fcs = clamp(l + (b - l) * att, 0.0, 1.0);
+    out_rgb[idx]   = r_fcs;
+    out_rgb[idx+1] = g_fcs;
+    out_rgb[idx+2] = b_fcs;
+    /* LDCI_H: horizontal luminance sum from ORIGINAL RGB */
+    float sum = l;
+    int r2 = ldci_radius;
+    for (int dx = 1; dx <= r2; dx++) {
+        int px_l = x - dx;
+        int px_r = x + dx;
+        if (px_l >= 0) { int i = (y * width + px_l) * 3; sum += 0.299f*rgb[i] + 0.587f*rgb[i+1] + 0.114f*rgb[i+2]; }
+        if (px_r < width) { int i = (y * width + px_r) * 3; sum += 0.299f*rgb[i] + 0.587f*rgb[i+1] + 0.114f*rgb[i+2]; }
+    }
+    horiz[y * width + x] = sum;
+}

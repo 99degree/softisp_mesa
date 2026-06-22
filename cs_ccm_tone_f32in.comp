@@ -1,0 +1,28 @@
+#version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, std430) readonly buffer IB { float r[]; };
+layout(set = 0, binding = 1, std430) buffer OB { float16_t o[]; };
+layout(set = 0, binding = 2, std430) readonly buffer MB { float m[9]; };
+layout(set = 0, binding = 3, std430) readonly buffer LB { float l[4096]; };
+layout(push_constant) uniform P { int w; int h; float g; float c; float b; float s; };
+void main() {
+    int y = int(gl_GlobalInvocationID.y), x = int(gl_GlobalInvocationID.x);
+    if (y >= h || x >= w) return;
+    int i = (y * w + x) * 3;
+    float r0 = r[i], g0 = r[i+1], b0 = r[i+2];
+    float R = clamp(m[0]*r0 + m[1]*g0 + m[2]*b0, 0.0, 1.0);
+    float G = clamp(m[3]*r0 + m[4]*g0 + m[5]*b0, 0.0, 1.0);
+    float B = clamp(m[6]*r0 + m[7]*g0 + m[8]*b0, 0.0, 1.0);
+    int li = int(clamp(R, 0.0, 1.0) * 4095.0); R = l[li];
+    li = int(clamp(G, 0.0, 1.0) * 4095.0); G = l[li];
+    li = int(clamp(B, 0.0, 1.0) * 4095.0); B = l[li];
+    R = (R-0.5)*c + 0.5 + b;
+    G = (G-0.5)*c + 0.5 + b;
+    B = (B-0.5)*c + 0.5 + b;
+    float lu = 0.299*R + 0.587*G + 0.114*B;
+    o[i]   = float16_t(clamp(lu + (R-lu)*s, 0.0, 1.0));
+    o[i+1] = float16_t(clamp(lu + (G-lu)*s, 0.0, 1.0));
+    o[i+2] = float16_t(clamp(lu + (B-lu)*s, 0.0, 1.0));
+}

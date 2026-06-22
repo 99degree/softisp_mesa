@@ -1,0 +1,34 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0, std430) readonly buffer IB { float16_t b[]; };
+layout(set = 0, binding = 1, std430) buffer OB { float r[]; };
+layout(push_constant) uniform P { int w; int h; int bpat; float _pad; };
+bool isR(int y,int x){return(y%2==1)&&(x%2==1);}
+bool isGr(int y,int x){return(y%2==1)&&(x%2==0);}
+bool isGb(int y,int x){return(y%2==0)&&(x%2==1);}
+bool isB(int y,int x){return(y%2==0)&&(x%2==0);}
+float ld(int y,int x){if(y<0||y>=h||x<0||x>=w)return 0.0;return float(b[y*w+x]);}
+void main(){
+    int y=int(gl_GlobalInvocationID.y),x=int(gl_GlobalInvocationID.x);
+    if(y>=h||x>=w)return;
+    int i=(y*w+x)*3;
+    float Rf,Gf,Bf;
+    float dh=abs(ld(y,x-1)-ld(y,x+1)),dv=abs(ld(y-1,x)-ld(y+1,x));
+    if(isR(y,x)){
+        Rf=ld(y,x);
+        float gh=(ld(y,x-1)+ld(y,x+1))*0.5,gv=(ld(y-1,x)+ld(y+1,x))*0.5;
+        Gf=(dh<dv)?gh:((dv<dh)?gv:(gh+gv)*0.5);
+        Bf=(ld(y-1,x-1)+ld(y-1,x+1)+ld(y+1,x-1)+ld(y+1,x+1))*0.25;
+    }else if(isB(y,x)){
+        Bf=ld(y,x);
+        float gh=(ld(y,x-1)+ld(y,x+1))*0.5,gv=(ld(y-1,x)+ld(y+1,x))*0.5;
+        Gf=(dh<dv)?gh:((dv<dh)?gv:(gh+gv)*0.5);
+        Rf=(ld(y-1,x-1)+ld(y-1,x+1)+ld(y+1,x-1)+ld(y+1,x+1))*0.25;
+    }else{
+        Gf=ld(y,x);
+        if(isGr(y,x)){Rf=(ld(y,x-1)+ld(y,x+1))*0.5;Bf=(ld(y-1,x)+ld(y+1,x))*0.5;}
+        else{Bf=(ld(y,x-1)+ld(y,x+1))*0.5;Rf=(ld(y-1,x)+ld(y+1,x))*0.5;}
+    }
+    r[i]=clamp(Rf,0.0,1.0);r[i+1]=clamp(Gf,0.0,1.0);r[i+2]=clamp(Bf,0.0,1.0);
+}

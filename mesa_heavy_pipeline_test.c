@@ -30,10 +30,12 @@
 
 /* Embedded SPIR-V for each pipeline stage */
 #include "cs_bayer_to_rgb_spv.h"
+#include "cs_bayer_to_rgb_f32_spv.h"
 #include "cs_blc_wb_spv.h"
 #include "cs_ccm_spv.h"
 #include "cs_tone_spv.h"
 #include "cs_ccm_tone_spv.h"
+#include "cs_ccm_tone_f32in_spv.h"
 #include "cs_fcs_spv.h"
 #include "cs_fcs_ldci_h_spv.h"
 #include "cs_rgb_to_argb_spv.h"
@@ -676,8 +678,9 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     int bpat = 1; /* BGGR */
     int n_bayer = width * height;
     int n_rgb   = width * height * 3;
-    VkDeviceSize bayer_bytes = n_bayer * sizeof(uint16_t);
-    VkDeviceSize rgb_bytes   = n_rgb * sizeof(uint16_t); /* float16_t storage */
+    VkDeviceSize bayer_bytes  = n_bayer * sizeof(uint16_t);
+    VkDeviceSize rgb_bytes    = n_rgb * sizeof(uint16_t); /* float16_t storage */
+    VkDeviceSize rgb32_bytes  = n_rgb * sizeof(float);    /* float32 storage */
 
     /* Create buffers */
     uint32_t buf_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -689,19 +692,22 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     GpuBuf buf_bayer  = gpu_buf(ctx, bayer_bytes, buf_usage, mem_flags);
     GpuBuf buf_rgb1   = gpu_buf(ctx, rgb_bytes,   buf_usage, mem_flags);
     GpuBuf buf_rgb2   = gpu_buf(ctx, rgb_bytes,   buf_usage, mem_flags);
+    GpuBuf buf_rgb32  = gpu_buf(ctx, rgb32_bytes, buf_usage, mem_flags);
     GpuBuf buf_horiz  = gpu_buf(ctx, n_bayer * sizeof(float), buf_usage, mem_flags);
     GpuBuf buf_argb   = gpu_buf(ctx, n_bayer * sizeof(uint32_t), buf_usage, mem_flags);
 
     /* Upload synthetic Bayer */
-    uint16_t *bayer = generate_bayer(width, height, bpat);
+    uint16_t *bayer = generate_bayer(width, height, bpat, abits);
     gpu_buf_upload(ctx, &buf_bayer, bayer);
 
     /* Create all compute stages */
     ComputeStage st_blc_wb  = stage_create(ctx, cs_blc_wb_spv, cs_blc_wb_spv_len, 3);
     ComputeStage st_demo    = stage_create(ctx, cs_bayer_to_rgb_spv, cs_bayer_to_rgb_spv_len, 2);
+    ComputeStage st_demo_f32= stage_create(ctx, cs_bayer_to_rgb_f32_spv, cs_bayer_to_rgb_f32_spv_len, 2);
     ComputeStage st_ccm     = stage_create(ctx, cs_ccm_spv, cs_ccm_spv_len, 3);
     ComputeStage st_tone    = stage_create(ctx, cs_tone_spv, cs_tone_spv_len, 3);
     ComputeStage st_ccm_tone= stage_create(ctx, cs_ccm_tone_spv, cs_ccm_tone_spv_len, 4);
+    ComputeStage st_ccm_tone_f32in= stage_create(ctx, cs_ccm_tone_f32in_spv, cs_ccm_tone_f32in_spv_len, 4);
     ComputeStage st_fcs     = stage_create(ctx, cs_fcs_spv, cs_fcs_spv_len, 2);
     ComputeStage st_fcs_lh  = stage_create(ctx, cs_fcs_ldci_h_spv, cs_fcs_ldci_h_spv_len, 3);
     ComputeStage st_ldci_h  = stage_create(ctx, cs_ldci_h_spv, cs_ldci_h_spv_len, 2);
@@ -817,13 +823,9 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
 
     /* Fast dispatch helper: just submit and wait, no malloc, no buffer create */
     FastStage f_blc = {st_blc_wb.ds, st_blc_wb.pl, st_blc_wb.pipeline, sizeof(PC_Bayer)};
-    FastStage f_demo = {st_demo.ds, st_demo.pl, st_demo.pipeline, sizeof(PC_Bayer)};
-    FastStage f_ccm = {st_ccm.ds, st_ccm.pl, st_ccm.pipeline, sizeof(PC_WHPad)};
-    FastStage f_tone = {st_tone.ds, st_tone.pl, st_tone.pipeline, sizeof(PC_Tone)};
-    FastStage f_ccm_tone = {st_ccm_tone.ds, st_ccm_tone.pl, st_ccm_tone.pipeline, sizeof(PC_Tone)};
-    FastStage f_fcs = {st_fcs.ds, st_fcs.pl, st_fcs.pipeline, sizeof(PC_Strength)};
+    FastStage f_demo_f32 = {st_demo_f32.ds, st_demo_f32.pl, st_demo_f32.pipeline, sizeof(PC_Bayer)};
+    FastStage f_ccm_tone_f32in = {st_ccm_tone_f32in.ds, st_ccm_tone_f32in.pl, st_ccm_tone_f32in.pipeline, sizeof(PC_Tone)};
     FastStage f_fcs_lh = {st_fcs_lh.ds, st_fcs_lh.pl, st_fcs_lh.pipeline, sizeof(PC_Ldci)};
-    FastStage f_lh = {st_ldci_h.ds, st_ldci_h.pl, st_ldci_h.pipeline, sizeof(PC_Ldci)};
     FastStage f_lv = {st_ldci_v.ds, st_ldci_v.pl, st_ldci_v.pipeline, sizeof(PC_Ldci)};
     FastStage f_ee = {st_ee.ds, st_ee.pl, st_ee.pipeline, sizeof(PC_Strength)};
     FastStage f_argb = {st_argb.ds, st_argb.pl, st_argb.pipeline, sizeof(PC_WHPad)};
@@ -836,90 +838,39 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     PC_Ldci pc_ldci = {width, height, 0.5f, 4};
     PC_Ldci pc_fcs_lh_pc = {width, height, 1.0f, 4}; /* fcs_strength=1.0, ldci_radius=4 */
 
-    /* Warm-up: run all stages once (not timed) - fix descriptors first */
+    /* Warm-up: run hybrid pipeline once (not timed) */
     {
-        /* BLC/WB: bayer -> rgb1 */
-        VkDescriptorBufferInfo dbi[] = {{buf_bayer.buf,0,VK_WHOLE_SIZE},{buf_rgb1.buf,0,VK_WHOLE_SIZE},{gains_buf.buf,0,VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet wds[] = {
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_blc_wb.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_blc_wb.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_blc_wb.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[2]},
-        };
-        vkUpdateDescriptorSets(ctx->dev, 3, wds, 0, NULL);
+        /* Update all descriptors (same as timed loop) */
+        {VkDescriptorBufferInfo d[]={{buf_bayer.buf,0,VK_WHOLE_SIZE},{buf_rgb1.buf,0,VK_WHOLE_SIZE},{gains_buf.buf,0,VK_WHOLE_SIZE}};
+         VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_blc_wb.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_blc_wb.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_blc_wb.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[2]}};
+         vkUpdateDescriptorSets(ctx->dev,3,w,0,NULL);}
+        {VkDescriptorBufferInfo d[]={{buf_rgb1.buf,0,VK_WHOLE_SIZE},{buf_rgb32.buf,0,VK_WHOLE_SIZE}};
+         VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_demo_f32.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_demo_f32.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]}};
+         vkUpdateDescriptorSets(ctx->dev,2,w,0,NULL);}
+        {VkDescriptorBufferInfo d[]={{buf_rgb32.buf,0,VK_WHOLE_SIZE},{buf_rgb2.buf,0,VK_WHOLE_SIZE},{ccm_buf.buf,0,VK_WHOLE_SIZE},{lut_buf.buf,0,VK_WHOLE_SIZE}};
+         VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone_f32in.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone_f32in.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone_f32in.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[2]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone_f32in.ds,.dstBinding=3,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[3]}};
+         vkUpdateDescriptorSets(ctx->dev,4,w,0,NULL);}
+        {VkDescriptorBufferInfo d[]={{buf_rgb2.buf,0,VK_WHOLE_SIZE},{buf_rgb1.buf,0,VK_WHOLE_SIZE},{buf_horiz.buf,0,VK_WHOLE_SIZE}};
+         VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs_lh.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs_lh.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs_lh.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[2]}};
+         vkUpdateDescriptorSets(ctx->dev,3,w,0,NULL);}
+        {VkDescriptorBufferInfo d[]={{buf_rgb1.buf,0,VK_WHOLE_SIZE},{buf_horiz.buf,0,VK_WHOLE_SIZE},{buf_rgb2.buf,0,VK_WHOLE_SIZE}};
+         VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_v.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_v.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_v.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[2]}};
+         vkUpdateDescriptorSets(ctx->dev,3,w,0,NULL);}
+        {VkDescriptorBufferInfo d[]={{buf_rgb2.buf,0,VK_WHOLE_SIZE},{buf_rgb1.buf,0,VK_WHOLE_SIZE}};
+         VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ee.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ee.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]}};
+         vkUpdateDescriptorSets(ctx->dev,2,w,0,NULL);}
+        {VkDescriptorBufferInfo d[]={{buf_rgb1.buf,0,VK_WHOLE_SIZE},{buf_argb.buf,0,VK_WHOLE_SIZE}};
+         VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_argb.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_argb.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]}};
+         vkUpdateDescriptorSets(ctx->dev,2,w,0,NULL);}
+
+        /* Dispatch all stages via fast_dispatch (not timed) */
         fast_dispatch(ctx, &f_blc, (width+31)/32, (height+7)/8, &pc_bayer);
-    }
-    {
-        /* Demosaic: rgb1 -> rgb2 */
-        VkDescriptorBufferInfo dbi[] = {{buf_rgb1.buf,0,VK_WHOLE_SIZE},{buf_rgb2.buf,0,VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet wds[] = {
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_demo.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_demo.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
-        };
-        vkUpdateDescriptorSets(ctx->dev, 2, wds, 0, NULL);
-        fast_dispatch(ctx, &f_demo, (width+15)/16, (height+15)/16, &pc_bayer);
-    }
-    {
-        /* CCM: rgb2 -> rgb1 */
-        VkDescriptorBufferInfo dbi[] = {{buf_rgb2.buf,0,VK_WHOLE_SIZE},{buf_rgb1.buf,0,VK_WHOLE_SIZE},{ccm_buf.buf,0,VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet wds[] = {
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[2]},
-        };
-        vkUpdateDescriptorSets(ctx->dev, 3, wds, 0, NULL);
-        fast_dispatch(ctx, &f_ccm, (width+15)/16, (height+15)/16, &pc_wh);
-    }
-    {
-        /* Tone: rgb1 -> rgb2 */
-        VkDescriptorBufferInfo dbi[] = {{buf_rgb1.buf,0,VK_WHOLE_SIZE},{buf_rgb2.buf,0,VK_WHOLE_SIZE},{lut_buf.buf,0,VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet wds[] = {
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_tone.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_tone.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_tone.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[2]},
-        };
-        vkUpdateDescriptorSets(ctx->dev, 3, wds, 0, NULL);
-        fast_dispatch(ctx, &f_tone, (width+15)/16, (height+15)/16, &pc_tone);
-    }
-    {
-        /* FCS: rgb2 -> rgb1 */
-        VkDescriptorBufferInfo dbi[] = {{buf_rgb2.buf,0,VK_WHOLE_SIZE},{buf_rgb1.buf,0,VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet wds[] = {
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
-        };
-        vkUpdateDescriptorSets(ctx->dev, 2, wds, 0, NULL);
-        fast_dispatch(ctx, &f_fcs, (width+15)/16, (height+15)/16, &pc_fcs_str);
-    }
-    {
-        /* LDCI_H: rgb1 -> horiz */
-        VkDescriptorBufferInfo dbi[] = {{buf_rgb1.buf,0,VK_WHOLE_SIZE},{buf_horiz.buf,0,VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet wds[] = {
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_h.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_h.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
-        };
-        vkUpdateDescriptorSets(ctx->dev, 2, wds, 0, NULL);
-        fast_dispatch(ctx, &f_lh, (width+15)/16, (height+15)/16, &pc_ldci);
-    }
-    {
-        /* LDCI_V: rgb1 + horiz -> rgb2 */
-        VkDescriptorBufferInfo dbi[] = {{buf_rgb1.buf,0,VK_WHOLE_SIZE},{buf_horiz.buf,0,VK_WHOLE_SIZE},{buf_rgb2.buf,0,VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet wds[] = {
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_v.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_v.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_v.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[2]},
-        };
-        vkUpdateDescriptorSets(ctx->dev, 3, wds, 0, NULL);
+        fast_dispatch(ctx, &f_demo_f32, (width+15)/16, (height+15)/16, &pc_bayer);
+        fast_dispatch(ctx, &f_ccm_tone_f32in, (width+15)/16, (height+15)/16, &pc_tone);
+        fast_dispatch(ctx, &f_fcs_lh, (width+15)/16, (height+15)/16, &pc_fcs_lh_pc);
         fast_dispatch(ctx, &f_lv, (width+15)/16, (height+15)/16, &pc_ldci);
-    }
-    {
-        /* EE: rgb2 -> rgb1 */
-        VkDescriptorBufferInfo dbi[] = {{buf_rgb2.buf,0,VK_WHOLE_SIZE},{buf_rgb1.buf,0,VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet wds[] = {
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ee.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
-            {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ee.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
-        };
-        vkUpdateDescriptorSets(ctx->dev, 2, wds, 0, NULL);
         fast_dispatch(ctx, &f_ee, (width+15)/16, (height+15)/16, &pc_strength);
+        fast_dispatch(ctx, &f_argb, (width+15)/16, (height+15)/16, &pc_wh);
     }
 
     /* Timed runs - no buffer creation, no malloc, just dispatch */
@@ -937,13 +888,19 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
         .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
     };
 
+    /* Hybrid pipeline: demosaic→CCM runs in float32 for precision, rest in float16 */
+    /* Fixed buffer assignments (no ping-pong): */
+    /*   BLC/WB: bayer → rgb1 (f16) */
+    /*   Demo_f32: rgb1 → rgb32 (f32) */
+    /*   CCM+Tone_f32in: rgb32 → rgb2 (f16) */
+    /*   FCS+LDCI_H: rgb2 → rgb1 (f16) + horiz */
+    /*   LDCI_V: rgb1 + horiz → rgb2 (f16) */
+    /*   EE: rgb2 → rgb1 (f16) */
+    /*   ARGB: rgb1 → argb (u32) */
     for (int iter = 0; iter < iters; iter++) {
-        GpuBuf *src = (iter & 1) ? &buf_rgb2 : &buf_rgb1;
-        GpuBuf *dst = (iter & 1) ? &buf_rgb1 : &buf_rgb2;
-
-        /* Update ALL descriptor sets for this iteration before recording */
+        /* Update ALL descriptor sets (fixed buffers, no ping-pong) */
         {
-            VkDescriptorBufferInfo dbi[] = {{buf_bayer.buf,0,VK_WHOLE_SIZE},{src->buf,0,VK_WHOLE_SIZE},{gains_buf.buf,0,VK_WHOLE_SIZE}};
+            VkDescriptorBufferInfo dbi[] = {{buf_bayer.buf,0,VK_WHOLE_SIZE},{buf_rgb1.buf,0,VK_WHOLE_SIZE},{gains_buf.buf,0,VK_WHOLE_SIZE}};
             VkWriteDescriptorSet wds[] = {
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_blc_wb.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_blc_wb.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
@@ -952,27 +909,28 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
             vkUpdateDescriptorSets(ctx->dev, 3, wds, 0, NULL);
         }
         {
-            VkDescriptorBufferInfo dbi[] = {{src->buf,0,VK_WHOLE_SIZE},{dst->buf,0,VK_WHOLE_SIZE}};
+            /* Demosaic f32: f16 Bayer → f32 RGB */
+            VkDescriptorBufferInfo dbi[] = {{buf_rgb1.buf,0,VK_WHOLE_SIZE},{buf_rgb32.buf,0,VK_WHOLE_SIZE}};
             VkWriteDescriptorSet wds[] = {
-                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_demo.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
-                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_demo.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
+                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_demo_f32.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
+                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_demo_f32.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
             };
             vkUpdateDescriptorSets(ctx->dev, 2, wds, 0, NULL);
         }
         {
-            /* Fused CCM+Tone: dst -> src, with CCM matrix + gamma LUT */
-            VkDescriptorBufferInfo dbi[] = {{dst->buf,0,VK_WHOLE_SIZE},{src->buf,0,VK_WHOLE_SIZE},{ccm_buf.buf,0,VK_WHOLE_SIZE},{lut_buf.buf,0,VK_WHOLE_SIZE}};
+            /* CCM+Tone f32in: f32 RGB → f16 RGB (precision saved through demosaic) */
+            VkDescriptorBufferInfo dbi[] = {{buf_rgb32.buf,0,VK_WHOLE_SIZE},{buf_rgb2.buf,0,VK_WHOLE_SIZE},{ccm_buf.buf,0,VK_WHOLE_SIZE},{lut_buf.buf,0,VK_WHOLE_SIZE}};
             VkWriteDescriptorSet wds[] = {
-                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
-                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
-                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[2]},
-                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone.ds,.dstBinding=3,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[3]},
+                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone_f32in.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
+                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone_f32in.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
+                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone_f32in.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[2]},
+                {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone_f32in.ds,.dstBinding=3,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[3]},
             };
             vkUpdateDescriptorSets(ctx->dev, 4, wds, 0, NULL);
         }
         {
-            /* Fused FCS+LDCI_H: read src (latest from CCM+Tone), write dst + horiz */
-            VkDescriptorBufferInfo dbi[] = {{src->buf,0,VK_WHOLE_SIZE},{dst->buf,0,VK_WHOLE_SIZE},{buf_horiz.buf,0,VK_WHOLE_SIZE}};
+            /* FCS+LDCI_H: f16 RGB → f16 RGB + horiz sums */
+            VkDescriptorBufferInfo dbi[] = {{buf_rgb2.buf,0,VK_WHOLE_SIZE},{buf_rgb1.buf,0,VK_WHOLE_SIZE},{buf_horiz.buf,0,VK_WHOLE_SIZE}};
             VkWriteDescriptorSet wds[] = {
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs_lh.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs_lh.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
@@ -981,7 +939,8 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
             vkUpdateDescriptorSets(ctx->dev, 3, wds, 0, NULL);
         }
         {
-            VkDescriptorBufferInfo dbi[] = {{dst->buf,0,VK_WHOLE_SIZE},{buf_horiz.buf,0,VK_WHOLE_SIZE},{src->buf,0,VK_WHOLE_SIZE}};
+            /* LDCI_V: f16 RGB + horiz → f16 RGB */
+            VkDescriptorBufferInfo dbi[] = {{buf_rgb1.buf,0,VK_WHOLE_SIZE},{buf_horiz.buf,0,VK_WHOLE_SIZE},{buf_rgb2.buf,0,VK_WHOLE_SIZE}};
             VkWriteDescriptorSet wds[] = {
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_v.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_v.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
@@ -990,7 +949,8 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
             vkUpdateDescriptorSets(ctx->dev, 3, wds, 0, NULL);
         }
         {
-            VkDescriptorBufferInfo dbi[] = {{src->buf,0,VK_WHOLE_SIZE},{dst->buf,0,VK_WHOLE_SIZE}};
+            /* EE: f16 RGB → f16 RGB */
+            VkDescriptorBufferInfo dbi[] = {{buf_rgb2.buf,0,VK_WHOLE_SIZE},{buf_rgb1.buf,0,VK_WHOLE_SIZE}};
             VkWriteDescriptorSet wds[] = {
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ee.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ee.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
@@ -998,8 +958,8 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
             vkUpdateDescriptorSets(ctx->dev, 2, wds, 0, NULL);
         }
         {
-            /* ARGB pack: read dst (EE output = buf_rgb2), write buf_argb */
-            VkDescriptorBufferInfo dbi[] = {{dst->buf,0,VK_WHOLE_SIZE},{buf_argb.buf,0,VK_WHOLE_SIZE}};
+            /* ARGB: f16 RGB → uint32 ARGB8888 */
+            VkDescriptorBufferInfo dbi[] = {{buf_rgb1.buf,0,VK_WHOLE_SIZE},{buf_argb.buf,0,VK_WHOLE_SIZE}};
             VkWriteDescriptorSet wds[] = {
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_argb.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_argb.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
@@ -1014,9 +974,9 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
 
         batch_cmd(cb, &f_blc, (width+31)/32, (height+7)/8, &pc_bayer);
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, NULL, 0, NULL);
-        batch_cmd(cb, &f_demo, (width+15)/16, (height+15)/16, &pc_bayer);
+        batch_cmd(cb, &f_demo_f32, (width+15)/16, (height+15)/16, &pc_bayer);
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, NULL, 0, NULL);
-        batch_cmd(cb, &f_ccm_tone, (width+15)/16, (height+15)/16, &pc_tone);
+        batch_cmd(cb, &f_ccm_tone_f32in, (width+15)/16, (height+15)/16, &pc_tone);
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, NULL, 0, NULL);
         batch_cmd(cb, &f_fcs_lh, (width+15)/16, (height+15)/16, &pc_fcs_lh_pc);
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mem_barrier, 0, NULL, 0, NULL);
@@ -1039,31 +999,47 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     /* Validate each stage output */
     printf("\n  Validation:\n");
 
-    /* Read back the final output (EE writes to buf_rgb1) — convert float16→float */
+    /* Read back final output (EE writes to buf_rgb1) — convert float16→float */
     uint16_t *f16 = malloc(rgb_bytes);
     float *result = malloc(n_rgb * sizeof(float));
     gpu_buf_download(ctx, &buf_rgb1, f16);
     for (int i = 0; i < n_rgb; i++) result[i] = half_to_float(f16[i]);
     int e = validate_rgb(result, width, height, "Final (after EE)");
 
-    /* Also validate intermediate: demosaic output */
-    gpu_buf_download(ctx, &buf_rgb2, f16);
-    for (int i = 0; i < n_rgb; i++) result[i] = half_to_float(f16[i]);
-    e += validate_rgb(result, width, height, "Demosaic");
+    /* Validate demosaic (f32 buffer — read directly as float, no half conversion) */
+    gpu_buf_download(ctx, &buf_rgb32, result);
+    e += validate_rgb(result, width, height, "Demosaic (f32)");
 
     /* Verify flat-gray region produces balanced output */
     /* Upload flat 50% gray Bayer, process, check balance */
     for (int i = 0; i < n_bayer; i++) bayer[i] = 32768; /* 0.5 in uint16 */
     gpu_buf_upload(ctx, &buf_bayer, bayer);
 
-    /* Run full pipeline on flat gray */
-    run_blc_wb(ctx, &st_blc_wb, &buf_bayer, &buf_rgb1, width, height, bpat, abits);
-    run_demosaic(ctx, &st_demo, &buf_rgb1, &buf_rgb2, width, height, bpat, abits);
-    run_ccm(ctx, &st_ccm, &buf_rgb2, &buf_rgb1, width, height);
-    run_tone(ctx, &st_tone, &buf_rgb1, &buf_rgb2, width, height);
-    run_fcs(ctx, &st_fcs, &buf_rgb2, &buf_rgb1, width, height);
-    run_ldci(ctx, &st_ldci_h, &st_ldci_v, &buf_rgb1, &buf_horiz, &buf_rgb2, width, height);
-    run_ee(ctx, &st_ee, &buf_rgb2, &buf_rgb1, width, height);
+    /* Run full hybrid pipeline on flat gray */
+    {VkDescriptorBufferInfo d[]={{buf_bayer.buf,0,VK_WHOLE_SIZE},{buf_rgb1.buf,0,VK_WHOLE_SIZE},{gains_buf.buf,0,VK_WHOLE_SIZE}};
+     VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_blc_wb.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_blc_wb.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_blc_wb.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[2]}};
+     vkUpdateDescriptorSets(ctx->dev,3,w,0,NULL);}
+    {VkDescriptorBufferInfo d[]={{buf_rgb1.buf,0,VK_WHOLE_SIZE},{buf_rgb32.buf,0,VK_WHOLE_SIZE}};
+     VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_demo_f32.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_demo_f32.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]}};
+     vkUpdateDescriptorSets(ctx->dev,2,w,0,NULL);}
+    {VkDescriptorBufferInfo d[]={{buf_rgb32.buf,0,VK_WHOLE_SIZE},{buf_rgb2.buf,0,VK_WHOLE_SIZE},{ccm_buf.buf,0,VK_WHOLE_SIZE},{lut_buf.buf,0,VK_WHOLE_SIZE}};
+     VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone_f32in.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone_f32in.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone_f32in.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[2]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone_f32in.ds,.dstBinding=3,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[3]}};
+     vkUpdateDescriptorSets(ctx->dev,4,w,0,NULL);}
+    {VkDescriptorBufferInfo d[]={{buf_rgb2.buf,0,VK_WHOLE_SIZE},{buf_rgb1.buf,0,VK_WHOLE_SIZE},{buf_horiz.buf,0,VK_WHOLE_SIZE}};
+     VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs_lh.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs_lh.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs_lh.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[2]}};
+     vkUpdateDescriptorSets(ctx->dev,3,w,0,NULL);}
+    {VkDescriptorBufferInfo d[]={{buf_rgb1.buf,0,VK_WHOLE_SIZE},{buf_horiz.buf,0,VK_WHOLE_SIZE},{buf_rgb2.buf,0,VK_WHOLE_SIZE}};
+     VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_v.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_v.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_v.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[2]}};
+     vkUpdateDescriptorSets(ctx->dev,3,w,0,NULL);}
+    {VkDescriptorBufferInfo d[]={{buf_rgb2.buf,0,VK_WHOLE_SIZE},{buf_rgb1.buf,0,VK_WHOLE_SIZE}};
+     VkWriteDescriptorSet w[]={{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ee.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[0]},{.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ee.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&d[1]}};
+     vkUpdateDescriptorSets(ctx->dev,2,w,0,NULL);}
+    fast_dispatch(ctx, &f_blc, (width+31)/32, (height+7)/8, &pc_bayer);
+    fast_dispatch(ctx, &f_demo_f32, (width+15)/16, (height+15)/16, &pc_bayer);
+    fast_dispatch(ctx, &f_ccm_tone_f32in, (width+15)/16, (height+15)/16, &pc_tone);
+    fast_dispatch(ctx, &f_fcs_lh, (width+15)/16, (height+15)/16, &pc_fcs_lh_pc);
+    fast_dispatch(ctx, &f_lv, (width+15)/16, (height+15)/16, &pc_ldci);
+    fast_dispatch(ctx, &f_ee, (width+15)/16, (height+15)/16, &pc_strength);
 
     gpu_buf_download(ctx, &buf_rgb1, f16);
     for (int i = 0; i < n_rgb; i++) result[i] = half_to_float(f16[i]);
@@ -1101,11 +1077,14 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     stage_destroy(ctx, &st_ldci_v);
     stage_destroy(ctx, &st_ee);
     stage_destroy(ctx, &st_argb);
+    stage_destroy(ctx, &st_demo_f32);
+    stage_destroy(ctx, &st_ccm_tone_f32in);
     gpu_buf_free(ctx, &buf_bayer);
     gpu_buf_free(ctx, &buf_rgb1);
     gpu_buf_free(ctx, &buf_rgb2);
     gpu_buf_free(ctx, &buf_horiz);
     gpu_buf_free(ctx, &buf_argb);
+    gpu_buf_free(ctx, &buf_rgb32);
     gpu_buf_free(ctx, &gains_buf);
     gpu_buf_free(ctx, &ccm_buf);
     gpu_buf_free(ctx, &lut_buf);

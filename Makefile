@@ -15,7 +15,7 @@ GLSLANG = glslangValidator
 # All shader sources
 SHADER_SRC  = cs_add.comp cs_heavy.comp \
               cs_bayer_to_rgb.comp cs_blc_wb.comp cs_ccm.comp \
-              cs_tone.comp cs_ccm_tone.comp cs_fcs.comp cs_fcs_ldci_h.comp cs_ldci_h.comp cs_ldci_v.comp cs_ee.comp cs_rgb_to_argb.comp
+              cs_tone.comp cs_ccm_tone.comp cs_ccm_tone_f32in.comp cs_fcs.comp cs_fcs_ldci_h.comp cs_ldci_h.comp cs_ldci_v.comp cs_ee.comp cs_rgb_to_argb.comp cs_bayer_to_rgb_f32.comp
 SHADER_HEADERS = $(SHADER_SRC:.comp=_spv.h)
 
 .PHONY: all clean shaders

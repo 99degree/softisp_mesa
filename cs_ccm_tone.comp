@@ -1,33 +1,29 @@
 #version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
 layout(local_size_x = 16, local_size_y = 16) in;
-layout(set = 0, binding = 0, std430) readonly buffer IB { float rgb[]; };
-layout(set = 0, binding = 1, std430) buffer OB { float outbuf[]; };
-layout(set = 0, binding = 2, std430) readonly buffer MB { float ccm[9]; };
-layout(set = 0, binding = 3, std430) readonly buffer LB { float lut[4096]; };
-layout(push_constant) uniform P {
-    int width; int height; float gamma; float contrast; float brightness; float saturation;
-};
+layout(set = 0, binding = 0, std430) readonly buffer IB { float16_t r[]; };
+layout(set = 0, binding = 1, std430) buffer OB { float16_t o[]; };
+layout(set = 0, binding = 2, std430) readonly buffer MB { float m[9]; };
+layout(set = 0, binding = 3, std430) readonly buffer LB { float l[4096]; };
+layout(push_constant) uniform P { int w; int h; float g; float c; float b; float s; };
 void main() {
-    int y = int(gl_GlobalInvocationID.y);
-    int x = int(gl_GlobalInvocationID.x);
-    if (y >= height || x >= width) return;
-    int idx = (y * width + x) * 3;
-    float r = rgb[idx], g = rgb[idx+1], b = rgb[idx+2];
-    /* CCM 3x3 */
-    float r2 = clamp(ccm[0]*r + ccm[1]*g + ccm[2]*b, 0.0, 1.0);
-    float g2 = clamp(ccm[3]*r + ccm[4]*g + ccm[5]*b, 0.0, 1.0);
-    float b2 = clamp(ccm[6]*r + ccm[7]*g + ccm[8]*b, 0.0, 1.0);
-    /* Gamma LUT */
-    int li = int(clamp(r2, 0.0, 1.0) * 4095.0); r2 = lut[li];
-    li = int(clamp(g2, 0.0, 1.0) * 4095.0); g2 = lut[li];
-    li = int(clamp(b2, 0.0, 1.0) * 4095.0); b2 = lut[li];
-    /* Contrast + Brightness */
-    r2 = (r2 - 0.5) * contrast + 0.5 + brightness;
-    g2 = (g2 - 0.5) * contrast + 0.5 + brightness;
-    b2 = (b2 - 0.5) * contrast + 0.5 + brightness;
-    /* Saturation */
-    float luma = 0.299f*r2 + 0.587f*g2 + 0.114f*b2;
-    outbuf[idx]   = clamp(luma + (r2 - luma) * saturation, 0.0, 1.0);
-    outbuf[idx+1] = clamp(luma + (g2 - luma) * saturation, 0.0, 1.0);
-    outbuf[idx+2] = clamp(luma + (b2 - luma) * saturation, 0.0, 1.0);
+    int y = int(gl_GlobalInvocationID.y), x = int(gl_GlobalInvocationID.x);
+    if (y >= h || x >= w) return;
+    int i = (y * w + x) * 3;
+    /* Float math to avoid Adreno float16_t bugs */
+    float r0 = float(r[i]), g0 = float(r[i+1]), b0 = float(r[i+2]);
+    float R = clamp(m[0]*r0 + m[1]*g0 + m[2]*b0, 0.0, 1.0);
+    float G = clamp(m[3]*r0 + m[4]*g0 + m[5]*b0, 0.0, 1.0);
+    float B = clamp(m[6]*r0 + m[7]*g0 + m[8]*b0, 0.0, 1.0);
+    int li = int(clamp(R, 0.0, 1.0) * 4095.0); R = l[li];
+    li = int(clamp(G, 0.0, 1.0) * 4095.0); G = l[li];
+    li = int(clamp(B, 0.0, 1.0) * 4095.0); B = l[li];
+    R = (R-0.5)*c + 0.5 + b;
+    G = (G-0.5)*c + 0.5 + b;
+    B = (B-0.5)*c + 0.5 + b;
+    float lu = 0.299*R + 0.587*G + 0.114*B;
+    o[i]   = float16_t(clamp(lu + (R-lu)*s, 0.0, 1.0));
+    o[i+1] = float16_t(clamp(lu + (G-lu)*s, 0.0, 1.0));
+    o[i+2] = float16_t(clamp(lu + (B-lu)*s, 0.0, 1.0));
 }

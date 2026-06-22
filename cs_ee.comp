@@ -1,20 +1,27 @@
 #version 460
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
 layout(local_size_x = 16, local_size_y = 16) in;
-layout(set = 0, binding = 0, std430) readonly buffer IB { float rgb[]; };
-layout(set = 0, binding = 1, std430) buffer OB { float outbuf[]; };
-layout(push_constant) uniform P { int width; int height; float strength; float _pad; };
-float ld(int y, int x, int c) {
-    if (y < 0 || y >= height || x < 0 || x >= width) return 0.0;
-    return rgb[(y * width + x) * 3 + c];
-}
-void main() {
-    int y = int(gl_GlobalInvocationID.y);
-    int x = int(gl_GlobalInvocationID.x);
-    if (y >= height || x >= width) return;
-    int idx = (y * width + x) * 3;
-    for (int c = 0; c < 3; c++) {
-        float center = ld(y, x, c);
-        float edge = -ld(y-1,x,c) - ld(y,x-1,c) + 4.0*center - ld(y,x+1,c) - ld(y+1,x,c);
-        outbuf[idx+c] = clamp(center + edge * strength, 0.0, 1.0);
+layout(set = 0, binding = 0, std430) readonly buffer IB { float16_t rgb[]; };
+layout(set = 0, binding = 1, std430) buffer OB { float16_t outbuf[]; };
+layout(push_constant) uniform P { int w; int h; float str; float _pad; };
+void main(){
+    int y=int(gl_GlobalInvocationID.y),x=int(gl_GlobalInvocationID.x);
+    if(y>=h||x>=w)return;
+    int i=(y*w+x)*3;
+    float r=float(rgb[i]),g=float(rgb[i+1]),b=float(rgb[i+2]);
+    float Y=0.299*r+0.587*g+0.114*b;
+    float lap=0.0;
+    int dx,dy;
+    for(dy=-1;dy<=1;dy++)for(dx=-1;dx<=1;dx++){
+        int cy=clamp(y+dy,0,h-1),cx=clamp(x+dx,0,w-1);
+        float p=float(rgb[(cy*w+cx)*3+1]);
+        float wgt=float((dx==0&&dy==0)?8:((dx==0||dy==0)?-1:0));
+        lap+=wgt*p;
     }
+    float factor=clamp((Y-0.1)/0.3,0.0,1.0);
+    lap*=str*factor;
+    outbuf[i]=float16_t(clamp(r+lap,0.0,1.0));
+    outbuf[i+1]=float16_t(clamp(g+lap,0.0,1.0));
+    outbuf[i+2]=float16_t(clamp(b+lap,0.0,1.0));
 }

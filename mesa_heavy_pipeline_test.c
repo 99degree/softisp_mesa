@@ -25,6 +25,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <string.h> /* memcpy */
 #include <vulkan/vulkan.h>
 
 /* Embedded SPIR-V for each pipeline stage */
@@ -128,11 +129,11 @@ static VulkanCtx vk_init(int prefer_gpu) {
         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = ctx.qfi, .queueCount = 1, .pQueuePriorities = &prio,
     };
-    const char *exts[] = { "VK_KHR_16bit_storage" };
+    const char *exts[] = { "VK_KHR_16bit_storage", "VK_KHR_shader_float16_int8" };
     VkDeviceCreateInfo dci = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1, .pQueueCreateInfos = &dqci,
-        .enabledExtensionCount = 1, .ppEnabledExtensionNames = exts,
+        .enabledExtensionCount = 2, .ppEnabledExtensionNames = exts,
     };
     VK_CHECK(vkCreateDevice(ctx.phys_dev, &dci, NULL, &ctx.dev), "vkCreateDevice");
     vkGetDeviceQueue(ctx.dev, ctx.qfi, 0, &ctx.queue);
@@ -367,6 +368,26 @@ static double stage_dispatch(VulkanCtx *ctx, ComputeStage *s,
     vkDestroyFence(ctx->dev, fence, NULL);
     vkFreeCommandBuffers(ctx->dev, ctx->pool, 1, &cb);
     return dt;
+}
+
+static float half_to_float(uint16_t h) {
+    uint32_t sign = (h >> 15) & 1;
+    uint32_t exp  = (h >> 10) & 0x1f;
+    uint32_t mant = h & 0x3ff;
+    if (exp == 0) {
+        if (mant == 0) return 0.0f;
+        while ((mant & 0x400) == 0) { mant <<= 1; exp--; }
+        mant &= 0x3ff;
+        exp = 127 - 14;
+    } else if (exp == 31) {
+        exp = 255;
+    } else {
+        exp = exp + 127 - 15;
+    }
+    uint32_t f = (sign << 31) | (exp << 23) | (mant << 13);
+    float result;
+    memcpy(&result, &f, sizeof(result));
+    return result;
 }
 
 /* Fast dispatch: uses pre-computed descriptor set, no malloc */
@@ -655,7 +676,7 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     int n_bayer = width * height;
     int n_rgb   = width * height * 3;
     VkDeviceSize bayer_bytes = n_bayer * sizeof(uint16_t);
-    VkDeviceSize rgb_bytes   = n_rgb * sizeof(float);
+    VkDeviceSize rgb_bytes   = n_rgb * sizeof(uint16_t); /* float16_t storage */
 
     /* Create buffers */
     uint32_t buf_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -946,20 +967,20 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[2]},
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ccm_tone.ds,.dstBinding=3,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[3]},
             };
-            vkUpdateDescriptorSets(ctx->dev, 3, wds, 0, NULL);
+            vkUpdateDescriptorSets(ctx->dev, 4, wds, 0, NULL);
         }
         {
-            /* Fused FCS+LDCI_H: dst -> src + horiz */
-            VkDescriptorBufferInfo dbi[] = {{dst->buf,0,VK_WHOLE_SIZE},{src->buf,0,VK_WHOLE_SIZE},{buf_horiz.buf,0,VK_WHOLE_SIZE}};
+            /* Fused FCS+LDCI_H: read src (latest from CCM+Tone), write dst + horiz */
+            VkDescriptorBufferInfo dbi[] = {{src->buf,0,VK_WHOLE_SIZE},{dst->buf,0,VK_WHOLE_SIZE},{buf_horiz.buf,0,VK_WHOLE_SIZE}};
             VkWriteDescriptorSet wds[] = {
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs_lh.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs_lh.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_fcs_lh.ds,.dstBinding=2,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[2]},
             };
-            vkUpdateDescriptorSets(ctx->dev, 2, wds, 0, NULL);
+            vkUpdateDescriptorSets(ctx->dev, 3, wds, 0, NULL);
         }
         {
-            VkDescriptorBufferInfo dbi[] = {{src->buf,0,VK_WHOLE_SIZE},{buf_horiz.buf,0,VK_WHOLE_SIZE},{dst->buf,0,VK_WHOLE_SIZE}};
+            VkDescriptorBufferInfo dbi[] = {{dst->buf,0,VK_WHOLE_SIZE},{buf_horiz.buf,0,VK_WHOLE_SIZE},{src->buf,0,VK_WHOLE_SIZE}};
             VkWriteDescriptorSet wds[] = {
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_v.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ldci_v.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
@@ -968,7 +989,7 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
             vkUpdateDescriptorSets(ctx->dev, 3, wds, 0, NULL);
         }
         {
-            VkDescriptorBufferInfo dbi[] = {{dst->buf,0,VK_WHOLE_SIZE},{src->buf,0,VK_WHOLE_SIZE}};
+            VkDescriptorBufferInfo dbi[] = {{src->buf,0,VK_WHOLE_SIZE},{dst->buf,0,VK_WHOLE_SIZE}};
             VkWriteDescriptorSet wds[] = {
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ee.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_ee.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
@@ -976,8 +997,8 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
             vkUpdateDescriptorSets(ctx->dev, 2, wds, 0, NULL);
         }
         {
-            /* ARGB pack: src (EE output) -> buf_argb */
-            VkDescriptorBufferInfo dbi[] = {{src->buf,0,VK_WHOLE_SIZE},{buf_argb.buf,0,VK_WHOLE_SIZE}};
+            /* ARGB pack: read dst (EE output = buf_rgb2), write buf_argb */
+            VkDescriptorBufferInfo dbi[] = {{dst->buf,0,VK_WHOLE_SIZE},{buf_argb.buf,0,VK_WHOLE_SIZE}};
             VkWriteDescriptorSet wds[] = {
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_argb.ds,.dstBinding=0,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[0]},
                 {.sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,.dstSet=st_argb.ds,.dstBinding=1,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,.pBufferInfo=&dbi[1]},
@@ -1017,13 +1038,16 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     /* Validate each stage output */
     printf("\n  Validation:\n");
 
-    /* Read back the final output (EE writes to buf_rgb1) */
-    float *result = malloc(rgb_bytes);
-    gpu_buf_download(ctx, &buf_rgb1, result);
+    /* Read back the final output (EE writes to buf_rgb1) — convert float16→float */
+    uint16_t *f16 = malloc(rgb_bytes);
+    float *result = malloc(n_rgb * sizeof(float));
+    gpu_buf_download(ctx, &buf_rgb1, f16);
+    for (int i = 0; i < n_rgb; i++) result[i] = half_to_float(f16[i]);
     int e = validate_rgb(result, width, height, "Final (after EE)");
 
     /* Also validate intermediate: demosaic output */
-    gpu_buf_download(ctx, &buf_rgb2, result);
+    gpu_buf_download(ctx, &buf_rgb2, f16);
+    for (int i = 0; i < n_rgb; i++) result[i] = half_to_float(f16[i]);
     e += validate_rgb(result, width, height, "Demosaic");
 
     /* Verify flat-gray region produces balanced output */
@@ -1040,7 +1064,8 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
     run_ldci(ctx, &st_ldci_h, &st_ldci_v, &buf_rgb1, &buf_horiz, &buf_rgb2, width, height);
     run_ee(ctx, &st_ee, &buf_rgb2, &buf_rgb1, width, height);
 
-    gpu_buf_download(ctx, &buf_rgb1, result);
+    gpu_buf_download(ctx, &buf_rgb1, f16);
+    for (int i = 0; i < n_rgb; i++) result[i] = half_to_float(f16[i]);
 
     double r_avg = 0, g_avg = 0, b_avg = 0;
     for (int i = 0; i < n_rgb; i += 3) {
@@ -1061,8 +1086,9 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
         printf("  >>> %s: FAIL (errors=%d)\n", label, e);
 
     /* Cleanup */
-    free(bayer);
+    free(f16);
     free(result);
+    free(bayer);
     stage_destroy(ctx, &st_blc_wb);
     stage_destroy(ctx, &st_demo);
     stage_destroy(ctx, &st_ccm);

@@ -1,36 +1,66 @@
 #version 460
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_16bit_storage : require
+/*
+ * Hamilton-Adams demosaic with Laplacian-corrected directional green
+ * interpolation and edge-aware gradient classifier.
+ *
+ * Output as float16_t for bandwidth-efficient storage.
+ * All math in float32 to avoid Adreno float16_t arithmetic bugs.
+ *
+ * References:
+ *   Adams & Hamilton, US Patent 5,629,734 (1997)
+ */
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0, std430) readonly buffer IB { float16_t b[]; };
 layout(set = 0, binding = 1, std430) buffer OB { float16_t r[]; };
 layout(push_constant) uniform P { int w; int h; int bpat; float _pad; };
-bool isR(int y,int x){return(y%2==1)&&(x%2==1);}
-bool isGr(int y,int x){return(y%2==1)&&(x%2==0);}
-bool isGb(int y,int x){return(y%2==0)&&(x%2==1);}
-bool isB(int y,int x){return(y%2==0)&&(x%2==0);}
-float16_t ld(int y,int x){if(y<0||y>=h||x<0||x>=w)return float16_t(0.0);return b[y*w+x];}
-void main(){
-    int y=int(gl_GlobalInvocationID.y),x=int(gl_GlobalInvocationID.x);
-    if(y>=h||x>=w)return;
-    int i=(y*w+x)*3;
-    /* Do all math in float to avoid Adreno float16_t arithmetic bugs */
-    float Rf,Gf,Bf;
-    float dh=abs(float(ld(y,x-1))-float(ld(y,x+1))),dv=abs(float(ld(y-1,x))-float(ld(y+1,x)));
-    if(isR(y,x)){
-        Rf=float(ld(y,x));
-        float gh=(float(ld(y,x-1))+float(ld(y,x+1)))*0.5,gv=(float(ld(y-1,x))+float(ld(y+1,x)))*0.5;
-        Gf=(dh<dv)?gh:((dv<dh)?gv:(gh+gv)*0.5);
-        Bf=(float(ld(y-1,x-1))+float(ld(y-1,x+1))+float(ld(y+1,x-1))+float(ld(y+1,x+1)))*0.25;
-    }else if(isB(y,x)){
-        Bf=float(ld(y,x));
-        float gh=(float(ld(y,x-1))+float(ld(y,x+1)))*0.5,gv=(float(ld(y-1,x))+float(ld(y+1,x)))*0.5;
-        Gf=(dh<dv)?gh:((dv<dh)?gv:(gh+gv)*0.5);
-        Rf=(float(ld(y-1,x-1))+float(ld(y-1,x+1))+float(ld(y+1,x-1))+float(ld(y+1,x+1)))*0.25;
-    }else{
-        Gf=float(ld(y,x));
-        if(isGr(y,x)){Rf=(float(ld(y,x-1))+float(ld(y,x+1)))*0.5;Bf=(float(ld(y-1,x))+float(ld(y+1,x)))*0.5;}
-        else{Bf=(float(ld(y,x-1))+float(ld(y,x+1)))*0.5;Rf=(float(ld(y-1,x))+float(ld(y+1,x)))*0.5;}
-    }
-    r[i]=float16_t(clamp(Rf,0.0,1.0));r[i+1]=float16_t(clamp(Gf,0.0,1.0));r[i+2]=float16_t(clamp(Bf,0.0,1.0));
+
+/* Clamped read as float32 */
+float p(int y, int x) {
+    return float(b[clamp(y,0,h-1)*w + clamp(x,0,w-1)]);
+}
+
+/* ── Green at red pixel ─────────────────────────────────────────── */
+float g_at_red(int y, int x, float center) {
+    float gh = (p(y,x-1) + p(y,x+1)) * 0.5f +
+               (center * 2.0f - p(y,x-2) - p(y,x+2)) * 0.25f;
+    float gv = (p(y-1,x) + p(y+1,x)) * 0.5f +
+               (center * 2.0f - p(y-2,x) - p(y+2,x)) * 0.25f;
+    float dh = abs(p(y,x-1) - p(y,x+1));
+    float dv = abs(p(y-1,x) - p(y+1,x));
+    const float eps = 1e-6f;
+    return (dh < dv - eps) ? gh : ((dv < dh - eps) ? gv : (gh + gv) * 0.5f);
+}
+float g_at_blue(int y, int x, float center) { return g_at_red(y, x, center); }
+
+float r_at_gr(int y, int x, float gc) {
+    return (p(y,x-1)+p(y,x+1))*0.5f + (gc*2.0f-p(y,x-2)-p(y,x+2))*0.25f;
+}
+float b_at_gr(int y, int x, float gc) {
+    return (p(y-1,x)+p(y+1,x))*0.5f + (gc*2.0f-p(y-2,x)-p(y+2,x))*0.25f;
+}
+float r_at_gb(int y, int x, float gc) {
+    return (p(y-1,x)+p(y+1,x))*0.5f + (gc*2.0f-p(y-2,x)-p(y+2,x))*0.25f;
+}
+float b_at_gb(int y, int x, float gc) {
+    return (p(y,x-1)+p(y,x+1))*0.5f + (gc*2.0f-p(y,x-2)-p(y,x+2))*0.25f;
+}
+float b_at_red(int y, int x) { return (p(y-1,x-1)+p(y-1,x+1)+p(y+1,x-1)+p(y+1,x+1))*0.25f; }
+float r_at_blue(int y, int x) { return (p(y-1,x-1)+p(y-1,x+1)+p(y+1,x-1)+p(y+1,x+1))*0.25f; }
+
+void main() {
+    int y = int(gl_GlobalInvocationID.y);
+    int x = int(gl_GlobalInvocationID.x);
+    if (y >= h || x >= w) return;
+    int i = (y * w + x) * 3;
+    float Rf, Gf, Bf;
+    float c = p(y, x);
+    if ((y & 1) == 1 && (x & 1) == 1) { Rf = c; Gf = g_at_red(y, x, c); Bf = b_at_red(y, x); }
+    else if ((y & 1) == 0 && (x & 1) == 0) { Bf = c; Gf = g_at_blue(y, x, c); Rf = r_at_blue(y, x); }
+    else if ((y & 1) == 1 && (x & 1) == 0) { Gf = c; Rf = r_at_gr(y, x, c); Bf = b_at_gr(y, x, c); }
+    else { Gf = c; Rf = r_at_gb(y, x, c); Bf = b_at_gb(y, x, c); }
+    r[i]   = float16_t(clamp(Rf, 0.0f, 1.0f));
+    r[i+1] = float16_t(clamp(Gf, 0.0f, 1.0f));
+    r[i+2] = float16_t(clamp(Bf, 0.0f, 1.0f));
 }

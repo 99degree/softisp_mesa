@@ -825,7 +825,9 @@ static int test_heavy_pipeline(VulkanCtx *ctx, int width, int height,
 
     /* Verify flat-gray region produces balanced output */
     /* Upload flat 50% gray Bayer, process, check balance */
-    for (int i = 0; i < n_bayer; i++) bayer[i] = 32768; /* 0.5 in uint16 */
+    /* Use 50% of active bit range (e.g., abits=12 → 2048 of 4095) */
+    uint16_t gray_val = (uint16_t)(1 << (abits-1)); /* ∼0.5 × 2^abits */
+    for (int i = 0; i < n_bayer; i++) bayer[i] = gray_val;
     gpu_buf_upload(ctx, &buf_bayer, bayer);
 
     /* Run full hybrid pipeline on flat gray */

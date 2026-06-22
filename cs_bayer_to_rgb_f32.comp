@@ -1,34 +1,122 @@
 #version 460
 #extension GL_EXT_shader_16bit_storage : require
+/*
+ * Hamilton-Adams demosaic with Laplacian-corrected directional green
+ * interpolation and edge-aware gradient classifier.
+ *
+ * References:
+ *   Adams & Hamilton, "Adaptive Color Plane Interpolation in Single
+ *   Sensor Color Electronic Camera" (US Patent 5,629,734, 1997)
+ *
+ * At R/B pixels: Laplacian-corrected G interpolation along edge direction
+ *   G_h = (G_left + G_right)/2 + (2*R - R_left2 - R_right2)/4
+ *   G_v = (G_up + G_down)/2 + (2*R - R_up2 - R_down2)/4
+ *   Gradient direction from horizontal vs vertical G differences
+ *
+ * At G pixels: Laplacian-corrected R/B interpolation
+ *   R_at_Gr = (R_left + R_right)/2 + (2*G - G_left2 - G_right2)/4
+ *   B_at_Gr = (B_up + B_down)/2 + (2*G - G_up2 - G_down2)/4
+ *
+ * Input:  float16_t Bayer (read as float32 for arithmetic)
+ * Output: float32 RGB
+ */
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0, std430) readonly buffer IB { float16_t b[]; };
 layout(set = 0, binding = 1, std430) buffer OB { float r[]; };
 layout(push_constant) uniform P { int w; int h; int bpat; float _pad; };
-bool isR(int y,int x){return(y%2==1)&&(x%2==1);}
-bool isGr(int y,int x){return(y%2==1)&&(x%2==0);}
-bool isGb(int y,int x){return(y%2==0)&&(x%2==1);}
-bool isB(int y,int x){return(y%2==0)&&(x%2==0);}
-float ld(int y,int x){if(y<0||y>=h||x<0||x>=w)return 0.0;return float(b[y*w+x]);}
-void main(){
-    int y=int(gl_GlobalInvocationID.y),x=int(gl_GlobalInvocationID.x);
-    if(y>=h||x>=w)return;
-    int i=(y*w+x)*3;
-    float Rf,Gf,Bf;
-    float dh=abs(ld(y,x-1)-ld(y,x+1)),dv=abs(ld(y-1,x)-ld(y+1,x));
-    if(isR(y,x)){
-        Rf=ld(y,x);
-        float gh=(ld(y,x-1)+ld(y,x+1))*0.5,gv=(ld(y-1,x)+ld(y+1,x))*0.5;
-        Gf=(dh<dv)?gh:((dv<dh)?gv:(gh+gv)*0.5);
-        Bf=(ld(y-1,x-1)+ld(y-1,x+1)+ld(y+1,x-1)+ld(y+1,x+1))*0.25;
-    }else if(isB(y,x)){
-        Bf=ld(y,x);
-        float gh=(ld(y,x-1)+ld(y,x+1))*0.5,gv=(ld(y-1,x)+ld(y+1,x))*0.5;
-        Gf=(dh<dv)?gh:((dv<dh)?gv:(gh+gv)*0.5);
-        Rf=(ld(y-1,x-1)+ld(y-1,x+1)+ld(y+1,x-1)+ld(y+1,x+1))*0.25;
-    }else{
-        Gf=ld(y,x);
-        if(isGr(y,x)){Rf=(ld(y,x-1)+ld(y,x+1))*0.5;Bf=(ld(y-1,x)+ld(y+1,x))*0.5;}
-        else{Bf=(ld(y,x-1)+ld(y,x+1))*0.5;Rf=(ld(y-1,x)+ld(y+1,x))*0.5;}
+
+/* Clamped read: returns float32 converted from float16_t stored Bayer */
+float p(int y, int x) {
+    return float(b[clamp(y,0,h-1)*w + clamp(x,0,w-1)]);
+}
+
+/* ── Green at red pixel ─────────────────────────────────────────── */
+float g_at_red(int y, int x, float center) {
+    /* Horizontal estimate with Laplacian correction */
+    float gh = (p(y,x-1) + p(y,x+1)) * 0.5f +
+               (center * 2.0f - p(y,x-2) - p(y,x+2)) * 0.25f;
+    /* Vertical estimate with Laplacian correction */
+    float gv = (p(y-1,x) + p(y+1,x)) * 0.5f +
+               (center * 2.0f - p(y-2,x) - p(y+2,x)) * 0.25f;
+    /* Edge direction from raw green differences */
+    float dh = abs(p(y,x-1) - p(y,x+1));
+    float dv = abs(p(y-1,x) - p(y+1,x));
+    /* Directional blend (smooth on-tie) */
+    const float eps = 1e-6f;
+    return (dh < dv - eps) ? gh : ((dv < dh - eps) ? gv : (gh + gv) * 0.5f);
+}
+
+/* ── Green at blue pixel (same as red, just different center color) ── */
+float g_at_blue(int y, int x, float center) { return g_at_red(y, x, center); }
+
+/* ── Red at Gr (green in red row) ────────────────────────────────── */
+float r_at_gr(int y, int x, float gc) {
+    float rh = (p(y,x-1) + p(y,x+1)) * 0.5f;
+    float corr = (gc * 2.0f - p(y,x-2) - p(y,x+2)) * 0.25f;
+    return rh + corr;
+}
+
+/* ── Blue at Gr (green in red row) ───────────────────────────────── */
+float b_at_gr(int y, int x, float gc) {
+    float bv = (p(y-1,x) + p(y+1,x)) * 0.5f;
+    float corr = (gc * 2.0f - p(y-2,x) - p(y+2,x)) * 0.25f;
+    return bv + corr;
+}
+
+/* ── Red at Gb (green in blue row) ───────────────────────────────── */
+float r_at_gb(int y, int x, float gc) {
+    float rv = (p(y-1,x) + p(y+1,x)) * 0.5f;
+    float corr = (gc * 2.0f - p(y-2,x) - p(y+2,x)) * 0.25f;
+    return rv + corr;
+}
+
+/* ── Blue at Gb (green in blue row) ──────────────────────────────── */
+float b_at_gb(int y, int x, float gc) {
+    float bh = (p(y,x-1) + p(y,x+1)) * 0.5f;
+    float corr = (gc * 2.0f - p(y,x-2) - p(y,x+2)) * 0.25f;
+    return bh + corr;
+}
+
+/* ── Blue at red pixel (diagonal average) ────────────────────────── */
+float b_at_red(int y, int x) {
+    return (p(y-1,x-1) + p(y-1,x+1) + p(y+1,x-1) + p(y+1,x+1)) * 0.25f;
+}
+
+/* ── Red at blue pixel (diagonal average) ─────────────────────────── */
+float r_at_blue(int y, int x) {
+    return (p(y-1,x-1) + p(y-1,x+1) + p(y+1,x-1) + p(y+1,x+1)) * 0.25f;
+}
+
+/* ── Main ──────────────────────────────────────────────────────────── */
+void main() {
+    int y = int(gl_GlobalInvocationID.y);
+    int x = int(gl_GlobalInvocationID.x);
+    if (y >= h || x >= w) return;
+
+    int i = (y * w + x) * 3;
+    float Rf, Gf, Bf;
+    float center = p(y, x);
+
+    /* BGGR pattern: (even,even)=B (even,odd)=Gb (odd,even)=Gr (odd,odd)=R */
+    if ((y & 1) == 1 && (x & 1) == 1) {     /* R */
+        Rf = center;
+        Gf = g_at_red(y, x, center);
+        Bf = b_at_red(y, x);
+    } else if ((y & 1) == 0 && (x & 1) == 0) {  /* B */
+        Bf = center;
+        Gf = g_at_blue(y, x, center);
+        Rf = r_at_blue(y, x);
+    } else if ((y & 1) == 1 && (x & 1) == 0) {  /* Gr */
+        Gf = center;
+        Rf = r_at_gr(y, x, center);
+        Bf = b_at_gr(y, x, center);
+    } else {                                      /* Gb */
+        Gf = center;
+        Rf = r_at_gb(y, x, center);
+        Bf = b_at_gb(y, x, center);
     }
-    r[i]=clamp(Rf,0.0,1.0);r[i+1]=clamp(Gf,0.0,1.0);r[i+2]=clamp(Bf,0.0,1.0);
+
+    r[i]   = clamp(Rf, 0.0f, 1.0f);
+    r[i+1] = clamp(Gf, 0.0f, 1.0f);
+    r[i+2] = clamp(Bf, 0.0f, 1.0f);
 }
